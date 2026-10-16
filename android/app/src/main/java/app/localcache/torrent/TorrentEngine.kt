@@ -34,7 +34,6 @@ import org.libtorrent4j.swig.int_byte_pair_vector
 import org.libtorrent4j.swig.libtorrent
 import org.libtorrent4j.swig.peer_info_vector
 import org.libtorrent4j.swig.settings_pack
-import org.libtorrent4j.swig.status_flags_t
 import org.libtorrent4j.swig.torrent_info
 import org.libtorrent4j.swig.tcp_endpoint_vector
 import java.io.File
@@ -156,7 +155,6 @@ object TorrentEngine {
         val pieceLength: Long,
         val firstPiece: Int,
         val lastPiece: Int,
-        val numPieces: Int,
         @Volatile var cursor: Int,
         @Volatile var playhead: Long = 0L,
         @Volatile var snapshot: TorrentPieces.Snapshot? = null,
@@ -169,9 +167,15 @@ object TorrentEngine {
 
     /** Copy callback data while alerts are valid; correctness never depends on diagnostics. */
     private class TransferEvents : AlertListener {
-        val paused = CopyOnWriteArrayList<TorrentHandle>()
-        val removed = CopyOnWriteArrayList<TorrentHandle>()
-        val errors = CopyOnWriteArrayList<Pair<TorrentHandle, String>>()
+        class State(val handle: TorrentHandle) {
+            @Volatile var paused = false
+            @Volatile var removed = false
+            @Volatile var error: String? = null
+        }
+        private val states = CopyOnWriteArrayList<State>()
+
+        fun watch(handle: TorrentHandle): State = states.firstOrNull { it.handle === handle }
+            ?: State(handle).also { states.add(it) }
 
         override fun types(): IntArray = intArrayOf(
             AlertType.TORRENT_PAUSED.swig(), AlertType.TORRENT_REMOVED.swig(),
@@ -179,12 +183,16 @@ object TorrentEngine {
         )
 
         override fun alert(alert: Alert<*>) {
+            // alert.handle() wraps borrowed native memory, valid only during this callback.
+            // Compare it now to the worker's owned handle and publish scalar data only.
+            val borrowed = (alert as? TorrentAlert<*>)?.handle() ?: return
+            val state = states.firstOrNull { it.handle == borrowed } ?: return
             when (alert) {
-                is TorrentPausedAlert -> paused.add(alert.handle())
-                is TorrentRemovedAlert -> removed.add(alert.handle())
-                is FileErrorAlert -> errors.add(alert.handle() to
-                    "Storage ${alert.operation()} (code ${alert.error().value}): ${alert.error().message}")
-                is TorrentErrorAlert -> errors.add(alert.handle() to "Torrent (code ${alert.error().value}): ${alert.error().message}")
+                is TorrentPausedAlert -> state.paused = true
+                is TorrentRemovedAlert -> state.removed = true
+                is FileErrorAlert -> state.error =
+                    "Storage ${alert.operation()} (code ${alert.error().value}): ${alert.error().message}"
+                is TorrentErrorAlert -> state.error = "Torrent (code ${alert.error().value}): ${alert.error().message}"
             }
         }
     }
@@ -362,6 +370,7 @@ object TorrentEngine {
             // Set the gate in add_torrent_params, before adding. AUTO_MANAGED could
             // otherwise clear UPLOAD_MODE while storage approval is still pending.
             val metadataHandle = addTorrent(manager, parameters(magnet, metadataDir), "$attempt/metadata")
+            events.watch(metadataHandle)
             handle = metadataHandle
             val metadata = awaitMetadata(metadataHandle, entry, cancelled, events)
             if (cancelled()) return Result(false, null)
@@ -425,6 +434,7 @@ object TorrentEngine {
             payload.set_renamed_files(names)
             payload.set_file_priorities(priorities)
             val added = addTorrent(manager, payload, "$attempt/payload")
+            events.watch(added)
             handle = added
 
             val pieceLength = torrentInfo.pieceLength().toLong()
@@ -447,7 +457,6 @@ object TorrentEngine {
                 pieceLength = pieceLength,
                 firstPiece = firstPiece,
                 lastPiece = lastPiece,
-                numPieces = torrentInfo.numPieces(),
                 cursor = firstPiece,
             )
             active = current
@@ -534,6 +543,7 @@ object TorrentEngine {
             if (wasStopped(manager)) return true
             phase = "closing torrent storage…"
             val id = handle.swig().id()
+            val state = events.watch(handle)
             val startedAt = monotonicMs()
             val context = alertContexts[id]
             DiagLog.t("storage closing attempt=$context handle=$id")
@@ -541,14 +551,14 @@ object TorrentEngine {
             handle.pause()
             // torrent_paused_alert is the documented disk-closed barrier. Invalidating
             // a handle or observing find()==null alone does not prove writes have stopped.
-            check(waitFor(DISK_RELEASE_TIMEOUT_MS) { wasStopped(manager) || events.paused.any { it == handle } }) {
+            check(waitFor(DISK_RELEASE_TIMEOUT_MS) { wasStopped(manager) || state.paused }) {
                 "Torrent storage did not close within 60 s; restart Local Cache before retrying or deleting"
             }
             if (wasStopped(manager)) return true
             DiagLog.t("storage paused attempt=$context elapsedMs=${monotonicMs() - startedAt}")
             manager.remove(handle)
             // Removed handles are invalid but still compare equal as weak pointers.
-            check(waitFor(20_000L) { wasStopped(manager) || events.removed.any { it == handle } }) {
+            check(waitFor(20_000L) { wasStopped(manager) || state.removed }) {
                 "Torrent did not leave the session; restart Local Cache before retrying or deleting"
             }
             DiagLog.t("storage removed attempt=$context elapsedMs=${monotonicMs() - startedAt}")
@@ -585,7 +595,7 @@ object TorrentEngine {
     }
 
     private fun checkNativeError(handle: TorrentHandle, events: TransferEvents, status: TorrentStatus = handle.status()) {
-        events.errors.firstOrNull { it.first == handle }?.let { throw IllegalStateException(it.second) }
+        events.watch(handle).error?.let { throw IllegalStateException(it) }
         val error = status.errorCode()
         check(error == null || error.value == 0) { "Torrent storage/network error: ${error?.message}" }
     }
@@ -649,7 +659,8 @@ object TorrentEngine {
         while (true) {
             if (cancelled()) return Result(false, null)
             if (!handle.isValid) return Result(false, "Torrent was removed from the session")
-            val status = handle.status(status_flags_t.all())
+            // Query only the piece map; copying other expensive status fields wastes TV CPU/RAM.
+            val status = handle.status(org.libtorrent4j.swig.torrent_handle.query_pieces)
             checkNativeError(handle, events, status)
             if (cancelled()) return Result(false, null)
             val checking = status.state().name.contains("CHECKING")
@@ -768,7 +779,7 @@ object TorrentEngine {
 
     /**
      * Re-mark the opening window and the MKV cue piece when the cursor or playhead moves.
-     * One `prioritizePieces` call; the old per-piece deadline loop stalled the pump on USB.
+     * One batched delta call; neither JNI calls nor allocations scale with the movie size.
      */
     private fun maybeApplyPriorities(current: Active) {
         val nearEnd = current.playhead > current.fileSize - TAIL_PROBE_BYTES
@@ -859,6 +870,7 @@ object TorrentEngine {
             append(" rate=").append(status.downloadPayloadRate())
             append(" pieces=").append(status.numPieces())
             append(" incoming=").append(status.hasIncoming())
+            append(" dhtNodes=").append(session?.dhtNodes())
             append(" tracker=").append(status.currentTracker().ifBlank { "-" })
             if (err.isNotBlank() && !err.equals("Success", ignoreCase = true) && !err.equals("No error", ignoreCase = true)) {
                 append(" err=").append(err)
@@ -883,7 +895,7 @@ object TorrentEngine {
         val name = type.name
         return name.contains("STATS") ||
             name.contains("LOG") ||
-            name.startsWith("DHT") ||
+            (name.startsWith("DHT") && name != "DHT_BOOTSTRAP" && name != "DHT_ERROR") ||
             name == "PIECE_FINISHED" ||
             name == "BLOCK_FINISHED" ||
             name == "BLOCK_DOWNLOADING" ||

@@ -127,7 +127,10 @@ object DiagLog {
             if (loadedPath != dest.absolutePath) {
                 // Only the background writer reads old logs; keep the export memory bounded.
                 previousSession = listOf(backup, dest).filter { it.isFile && it.length() <= MAX_FILE_BYTES + 128 * 4096 }
-                    .joinToString("\n") { it.readText().takeLast(128 * 1024) }.takeLast(256 * 1024)
+                    .joinToString("\n") { old ->
+                        old.readText().takeLast(128 * 1024).lineSequence()
+                            .joinToString("\n") { DiagnosticText.sanitize(it) }
+                    }.takeLast(256 * 1024)
                 loadedPath = dest.absolutePath
             }
             val currentGeneration = generation.get()

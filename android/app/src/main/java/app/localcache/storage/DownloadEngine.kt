@@ -6,6 +6,8 @@ import app.localcache.Prefs
 import app.localcache.DiagLog
 import app.localcache.server.UpstreamProxy
 import app.localcache.torrent.TorrentEngine
+import app.localcache.net.DownloadNetworkLog
+import app.localcache.net.DownloadTrace
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -17,6 +19,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.UUID
 
 object DownloadEngine {
     private const val TAG = "DownloadEngine"
@@ -33,7 +36,9 @@ object DownloadEngine {
         .followRedirects(true)
         .followSslRedirects(true)
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(6, TimeUnit.HOURS)
+        // This is an inactivity timeout, not a limit on the duration of a 90 GB transfer.
+        .readTimeout(90, TimeUnit.SECONDS)
+        .eventListenerFactory { DownloadNetworkLog(it) }
         .build()
 
     // One download at a time: debrid links throttle parallel connections, and the drive
@@ -67,6 +72,7 @@ object DownloadEngine {
 
     /** One download attempt, so a cancelled run can tell itself apart from a failure. */
     private class Run(val cacheKey: String, val target: Target) {
+        val attempt = "${cacheKey.take(12)}-${UUID.randomUUID().toString().take(8)}"
         @Volatile
         var cancelled = false
 
@@ -479,6 +485,11 @@ object DownloadEngine {
         val allocated = if (entry.isTorrent) DiskQuota.allocatedBytes(target.part) else onDisk
         val needed = StorageBudget.remaining(entry.totalBytes, onDisk)
         val diskNeeded = StorageBudget.remaining(entry.totalBytes, allocated)
+        if (entry.totalBytes > DiskQuota.effectiveQuotaBytes(context)) {
+            entry.status = "error"
+            entry.lastError = "Movie size (${gb(entry.totalBytes)} GB) exceeds the cache limit (${gb(DiskQuota.effectiveQuotaBytes(context))} GB)"
+            return null
+        }
         DiagLog.t("storage approval key=${entry.cacheKey} total=${entry.totalBytes} logical=$onDisk " +
             "allocated=$allocated fs=${mount?.fsType ?: "unknown"} readOnly=${mount?.readOnly}")
         val result = DiskQuota.ensureSpace(context, needed, setOf(entry.cacheKey), diskNeeded)
@@ -523,6 +534,7 @@ object DownloadEngine {
         try {
             val builder = Request.Builder()
                 .url(entry.url)
+                .tag(DownloadTrace::class.java, DownloadTrace(run.attempt, entry.cacheKey))
                 .header("User-Agent", "LocalCache/0.4.17")
             if (downloaded > 0) {
                 builder.header("Range", "bytes=$downloaded-")
@@ -574,12 +586,20 @@ object DownloadEngine {
                         var sampleBytes = downloaded
                         val startedAt = downloaded
                         var openedPlayback = false
+                        var logAt = System.nanoTime()
+                        var readNanos = 0L
+                        var writeNanos = 0L
+                        var flushNanos = 0L
 
                         while (true) {
                             if (run.cancelled) throw Cancelled()
+                            val readAt = System.nanoTime()
                             val read = input.read(buffer)
+                            readNanos += System.nanoTime() - readAt
                             if (read <= 0) break
+                            val writeAt = System.nanoTime()
                             out.write(buffer, 0, read)
+                            writeNanos += System.nanoTime() - writeAt
                             downloaded += read
                             entry.downloadedBytes = downloaded
 
@@ -587,7 +607,9 @@ object DownloadEngine {
                             // 4 MB buffer can hold them back for seconds on a slow link.
                             // Publish the first chunk straight away, then resume coalescing.
                             if (!openedPlayback && downloaded - startedAt >= FIRST_FLUSH_BYTES) {
+                                val flushAt = System.nanoTime()
                                 out.flush()
+                                flushNanos += System.nanoTime() - flushAt
                                 openedPlayback = true
                             }
 
@@ -596,6 +618,13 @@ object DownloadEngine {
                                 entry.bytesPerSec = (downloaded - sampleBytes) * 1000 / (now - sampleAt)
                                 sampleAt = now
                                 sampleBytes = downloaded
+                            }
+                            if (DiagLog.enabled && System.nanoTime() - logAt >= 15_000_000_000L) {
+                                DiagLog.t("http progress attempt=${run.attempt} key=${entry.cacheKey} bytes=$downloaded " +
+                                    "total=${entry.totalBytes} rate=${entry.bytesPerSec} networkReadMs=${readNanos / 1_000_000} " +
+                                    "bufferedWriteMs=${writeNanos / 1_000_000} flushMs=${flushNanos / 1_000_000} free=${partFile.parentFile?.usableSpace}")
+                                logAt = System.nanoTime()
+                                readNanos = 0; writeNanos = 0; flushNanos = 0
                             }
 
                             if (downloaded > budgetBytes) {
@@ -606,7 +635,10 @@ object DownloadEngine {
                         }
                     }
                     out.flush()
+                    val syncAt = System.nanoTime()
+                    DiagLog.t("http sync-start attempt=${run.attempt} bytes=$downloaded")
                     raw.fd.sync()
+                    DiagLog.t("http sync-end attempt=${run.attempt} elapsedMs=${(System.nanoTime() - syncAt) / 1_000_000}")
                 }
 
                 if (downloaded < MIN_VALID_BYTES) {
@@ -623,6 +655,7 @@ object DownloadEngine {
                 entry.totalBytes = target.final.length()
                 entry.lastError = null
                 Log.i(TAG, "complete ${entry.cacheKey} (${target.final.length()} bytes)")
+                DiagLog.i("http complete attempt=${run.attempt} bytes=${target.final.length()}")
             }
         } catch (e: Exception) {
             entry.bytesPerSec = 0
@@ -635,6 +668,8 @@ object DownloadEngine {
             }
 
             Log.e(TAG, "failed ${entry.cacheKey}: ${e.message}")
+            DiagLog.e("http failed attempt=${run.attempt} bytes=$downloaded total=${entry.totalBytes} " +
+                "exception=${e.javaClass.simpleName} error=${e.message} ${app.localcache.DeviceDiagnostics.snapshot()}")
             entry.status = "error"
             entry.lastError = e.message ?: e.javaClass.simpleName
             // A file that cannot fit will never finish — reclaim what it took.

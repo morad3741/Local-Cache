@@ -156,6 +156,23 @@ class TorrentNativeTest {
         assertArrayEquals(movie, final.readBytes())
     }
 
+    @Test
+    fun repeatedCancellationAndAlertReuseKeepStorageBarriersMatched() {
+        val entry = seededEntry(uploadLimit = 64 * 1024)
+        repeat(3) {
+            cancelled.set(false)
+            val transfer = download(entry) { true }
+            await("payload on retry $it", 30_000) { entry.verifiedBytes > 0 && !transfer.isDone }
+            cancelled.set(true)
+            assertFalse(transfer.get(20, TimeUnit.SECONDS).ok)
+            // Native alert memory has been recycled by now. Only callback-copied state is safe.
+            System.gc()
+            assertNull(TorrentEngine.storageReleaseError())
+            assertNoLateWrites()
+            assertTrue(part.delete())
+        }
+    }
+
     private fun assertNoLateWrites() {
         part.writeBytes(sentinel)
         Thread.sleep(500)

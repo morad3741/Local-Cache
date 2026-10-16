@@ -99,13 +99,14 @@ object DiskQuota {
         var usage = usageBytes(context)
         var free = freeSpaceOnDrive(context)
         var freed = 0L
+        val headroom = minOf(DRIVE_HEADROOM, (capacityBytes(context) / 20).coerceAtLeast(64L * 1024 * 1024))
 
         // An impossible request must not wipe every idle movie before being rejected.
-        if (requiredBytes > quota) return Result(0, usage, StorageBudget.room(quota, usage, free, DRIVE_HEADROOM), false)
+        if (requiredBytes > quota) return Result(0, usage, StorageBudget.room(quota, usage, free, headroom), false)
 
         // Free space matters as much as the quota: the drive can be full while usage is
         // still under the limit, and then no amount of quota headroom helps.
-        if (!StorageBudget.fits(quota, usage, requiredBytes, free, requiredDiskBytes, DRIVE_HEADROOM)) {
+        if (!StorageBudget.fits(quota, usage, requiredBytes, free, requiredDiskBytes, headroom)) {
             val protectedPaths = protectedPaths(keepKeys)
             val candidates = root.listFiles()
                 ?.filter {
@@ -117,7 +118,7 @@ object DiskQuota {
                 ?: emptyList()
 
             for (file in candidates) {
-                if (StorageBudget.fits(quota, usage, requiredBytes, free, requiredDiskBytes, DRIVE_HEADROOM)) break
+                if (StorageBudget.fits(quota, usage, requiredBytes, free, requiredDiskBytes, headroom)) break
                 val size = file.length()
                 val name = file.name
                 if (DownloadEngine.deleteIdleFile(file) {
@@ -133,12 +134,12 @@ object DiskQuota {
             }
         }
 
-        val room = StorageBudget.room(quota, usage, free, DRIVE_HEADROOM)
+        val room = StorageBudget.room(quota, usage, free, headroom)
         if (freed > 0) {
             Log.i(TAG, "freed ${freed / (1024 * 1024)} MB — now ${usage / GB} / ${quota / GB} GB")
         }
-        val enough = StorageBudget.fits(quota, usage, requiredBytes, free, requiredDiskBytes, DRIVE_HEADROOM)
-        DiagLog.t("space quota=$quota logical=$usage free=$free headroom=$DRIVE_HEADROOM " +
+        val enough = StorageBudget.fits(quota, usage, requiredBytes, free, requiredDiskBytes, headroom)
+        DiagLog.t("space quota=$quota logical=$usage free=$free headroom=$headroom " +
             "quotaGrowth=$requiredBytes diskGrowth=$requiredDiskBytes freed=$freed enough=$enough")
         return Result(freed, usage, room, enough)
     }

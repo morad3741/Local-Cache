@@ -6,6 +6,7 @@ import android.content.SharedPreferences
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.localcache.Prefs
+import app.localcache.DiagLog
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -20,6 +21,7 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
 
 /** Real HTTP/coroutine/filesystem lifecycle on a dedicated Android test device. */
 @RunWith(AndroidJUnit4::class)
@@ -37,6 +39,7 @@ class DownloadLifecycleTest {
         val scope = "download-test-${UUID.randomUUID()}-"
         context = object : ContextWrapper(base) {
             override fun getApplicationContext(): Context = this
+            override fun getFilesDir(): File = File(root, "app-files").apply { mkdirs() }
             override fun getSharedPreferences(name: String, mode: Int): SharedPreferences =
                 base.getSharedPreferences(scope + name, mode)
         }
@@ -61,10 +64,34 @@ class DownloadLifecycleTest {
 
     @After
     fun teardown() {
+        DiagLog.setEnabled(context, false)
         DownloadEngine.cancelActive(deletePartial = false)
         await("worker closed", 15_000) { !DownloadEngine.isBusy() }
         server.shutdown()
         root.deleteRecursively() // Owned test directory only, after the real worker is done.
+    }
+
+    @Test
+    fun concurrentDiagnosticsAreBoundedRedactedAndPersistAwayFromPayload() {
+        DiagLog.setEnabled(context, true)
+        val workers = (0 until 4).map { worker ->
+            thread {
+                repeat(350) { index ->
+                    DiagLog.t("worker=$worker event=$index https://user:password@tracker.test/PASSKEY/announce?token=SECRET")
+                }
+            }
+        }
+        workers.forEach { it.join(5_000); assertFalse("logging caller blocked on IO", it.isAlive) }
+        val dump = DiagLog.dump()
+        assertFalse(dump.contains("PASSKEY"))
+        assertFalse(dump.contains("SECRET"))
+        assertFalse(dump.contains("password"))
+        assertTrue(dump.contains("tracker.test"))
+        assertTrue(dump.lineSequence().count() < 930)
+        val persisted = File(context.filesDir, "local-cache-debug.log")
+        await("asynchronous diagnostic persistence", 10_000) { persisted.length() > 0 }
+        assertTrue(persisted.length() <= 1024 * 1024)
+        assertFalse(File(root, "local-cache-debug.log").exists())
     }
 
     @Test
