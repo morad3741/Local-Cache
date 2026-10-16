@@ -94,6 +94,7 @@ object DownloadEngine {
     /** False means the caller must answer/retry rather than wait for a worker that wasn't admitted. */
     fun ensureStarted(context: Context, cacheKey: String, fromQueue: Boolean = false): Boolean {
         appContext = context.applicationContext
+        if (!acceptingDownloads) return false // Do not probe a stalled USB while admission is closed.
         val entry = CacheRegistry.get(cacheKey) ?: return false
         val target = resolveTarget(context, entry) ?: return false
 

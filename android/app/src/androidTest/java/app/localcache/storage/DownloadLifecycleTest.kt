@@ -86,6 +86,8 @@ class DownloadLifecycleTest {
         try {
             local.startServer()
             assertNull(DownloadEngine.pauseForShutdown())
+            val untouched = File(root, "closed-admission-must-not-probe")
+            Prefs.setCacheDirPath(context, untouched.absolutePath)
             OkHttpClient.Builder().readTimeout(5, TimeUnit.SECONDS).build()
                 .newCall(Request.Builder().url("http://127.0.0.1:${local.listeningPort}/video/${entry.cacheKey}").build())
                 .execute().use { response ->
@@ -93,6 +95,7 @@ class DownloadLifecycleTest {
                     assertEquals("2", response.header("Retry-After"))
                 }
             assertFalse(DownloadEngine.isBusy())
+            assertFalse("closed admission touched the drive", untouched.exists())
             assertEquals(0, server.requestCount)
         } finally {
             local.stop()
