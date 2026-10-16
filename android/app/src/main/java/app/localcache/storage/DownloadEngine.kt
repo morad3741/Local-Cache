@@ -442,7 +442,8 @@ object DownloadEngine {
         }
     }
 
-    fun isBusy(): Boolean = synchronized(lock) { activeKeyValue != null }
+    // Notification/UI reads must not wait behind filesystem cleanup under the worker lock.
+    fun isBusy(): Boolean = activeKeyValue != null
 
     /** Close admission before joining the tail, which includes every predecessor's cleanup. */
     fun pauseForShutdown(): Job? = synchronized(lock) {
