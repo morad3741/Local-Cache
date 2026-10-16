@@ -4,13 +4,13 @@ import android.content.Context
 import android.util.Log
 import app.localcache.Prefs
 import app.localcache.DiagLog
-import app.localcache.server.UpstreamProxy
 import app.localcache.torrent.TorrentEngine
 import app.localcache.net.DownloadNetworkLog
 import app.localcache.net.DownloadTrace
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import okhttp3.Call
 import okhttp3.OkHttpClient
@@ -45,6 +45,8 @@ object DownloadEngine {
     // cannot write two movies and feed the player at once. Whatever the viewer just
     // pressed play on wins, and the previous download steps aside.
     private val lock = Any()
+    private val workers = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var acceptingDownloads = true // Also permits isolated engine tests without a service.
     private var activeJob: Job? = null
     private var activeRun: Run? = null
     private val pendingRuns = mutableSetOf<Run>()
@@ -97,6 +99,7 @@ object DownloadEngine {
         val ctx = context.applicationContext
 
         synchronized(lock) {
+            if (!acceptingDownloads) return
             if (!fromQueue) resumeQueue.clear()
 
             // A previously completed file needs no worker and must not interrupt an
@@ -132,7 +135,7 @@ object DownloadEngine {
                     "part=${target.part.absolutePath} status=${entry.status}",
             )
 
-            activeJob = CoroutineScope(Dispatchers.IO).launch {
+            activeJob = workers.launch {
                 try {
                     // Let the old connection finish tearing down before touching the drive.
                     previous?.join()
@@ -166,20 +169,8 @@ object DownloadEngine {
                         return@launch
                     }
 
-                    if (entry.totalBytes <= 0) {
-                        val total = UpstreamProxy.fetchTotalBytesSync(entry.url)
-                        if (total > 0) entry.totalBytes = total
-                    }
-
                     if (run.cancelled) return@launch
-
-                    val budget = makeRoom(ctx, entry, target) ?: return@launch
-
-                    // Record where this file came from before writing a byte, so the drive
-                    // stays self-describing even if the app or the upstream disappears.
-                    LocalLibrary.writeMeta(entry)
-
-                    download(entry, target, budget, run)
+                    download(ctx, entry, target, run)
                 } finally {
                     val finishedOk = synchronized(lock) {
                         // The job includes this cleanup. A replacement joins it before
@@ -226,6 +217,7 @@ object DownloadEngine {
         if (entry.url.isBlank()) return
 
         val startNow = synchronized(lock) {
+            if (!acceptingDownloads) return
             if (activeKeyValue == null || activeRun?.cancelled == true) {
                 true
             } else if (activeKeyValue == cacheKey) {
@@ -311,6 +303,7 @@ object DownloadEngine {
         if (ready.isEmpty()) return "None of the selected files can be resumed (complete files stay as-is)."
 
         synchronized(lock) {
+            if (!acceptingDownloads) return "Server is stopping; start the server before resuming downloads."
             resumeQueue.clear()
             ready.drop(1).forEach { resumeQueue.addLast(it) }
             ready.drop(1).forEach { key ->
@@ -391,7 +384,10 @@ object DownloadEngine {
         deleteSelected(context, cacheKeys)
 
     private fun startNextQueued(context: Context) {
-        val next = synchronized(lock) { resumeQueue.removeFirstOrNull() } ?: return
+        val next = synchronized(lock) {
+            if (!acceptingDownloads) return
+            resumeQueue.removeFirstOrNull()
+        } ?: return
         Log.i(TAG, "queue: starting $next")
         ensureStarted(context, next, fromQueue = true)
     }
@@ -444,6 +440,21 @@ object DownloadEngine {
     }
 
     fun isBusy(): Boolean = synchronized(lock) { activeKeyValue != null }
+
+    /** Close admission before joining the tail, which includes every predecessor's cleanup. */
+    fun pauseForShutdown(): Job? = synchronized(lock) {
+        acceptingDownloads = false
+        resumeQueue.clear()
+        pendingRuns.forEach { it.stop() }
+        stopActiveLocked("paused — server stopped", deletePartial = false)
+        activeJob
+    }
+
+    fun resumeAfterShutdown() = synchronized(lock) {
+        check(pendingRuns.isEmpty()) { "Previous download storage is still closing" }
+        check(TorrentEngine.storageReleaseError() == null) { "Torrent storage did not close" }
+        acceptingDownloads = true
+    }
 
     fun activeKey(): String? = activeKeyValue
 
@@ -526,7 +537,7 @@ object DownloadEngine {
         return Target(finalFile, CachePaths.partFile(finalFile))
     }
 
-    private fun download(entry: CacheEntry, target: Target, budgetBytes: Long, run: Run) {
+    private fun download(context: Context, entry: CacheEntry, target: Target, run: Run) {
         val partFile = target.part
         var downloaded = if (partFile.exists()) partFile.length() else 0L
         entry.downloadedBytes = downloaded
@@ -536,6 +547,7 @@ object DownloadEngine {
                 .url(entry.url)
                 .tag(DownloadTrace::class.java, DownloadTrace(run.attempt, entry.cacheKey))
                 .header("User-Agent", "LocalCache/0.4.17")
+                .header("Accept-Encoding", "identity")
             if (downloaded > 0) {
                 builder.header("Range", "bytes=$downloaded-")
                 Log.i(TAG, "resume ${entry.cacheKey} from $downloaded")
@@ -558,23 +570,25 @@ object DownloadEngine {
                     throw IllegalStateException("Upstream sent $contentType, not a video")
                 }
 
-                // Server ignored our Range header - start over rather than corrupt the file.
-                if (downloaded > 0 && response.code == 200) {
-                    Log.w(TAG, "range ignored, restarting ${entry.cacheKey}")
-                    downloaded = 0
-                    entry.downloadedBytes = 0
-                }
-
                 val body = response.body ?: throw IllegalStateException("Empty response body")
-                val contentLength = body.contentLength()
-                entry.totalBytes = when (response.code) {
-                    206 -> {
-                        val range = response.header("Content-Range")
-                        Regex("/(\\d+)$").find(range ?: "")?.groupValues?.get(1)?.toLongOrNull()
-                            ?: (downloaded + contentLength)
-                    }
-                    else -> contentLength.coerceAtLeast(entry.totalBytes)
+                val encoding = response.header("Content-Encoding").orEmpty()
+                check(encoding.isBlank() || encoding.equals("identity", ignoreCase = true)) {
+                    "Upstream ignored identity encoding: $encoding"
                 }
+                val transfer = HttpTransfer.response(response.code, response.header("Content-Range"), downloaded, body.contentLength())
+                check(transfer.total < 0 || transfer.total >= MIN_VALID_BYTES) { "Only ${transfer.total} bytes offered" }
+                if (transfer.offset != downloaded) {
+                    Log.w(TAG, "range ignored, restarting ${entry.cacheKey}")
+                    downloaded = transfer.offset
+                    entry.downloadedBytes = downloaded
+                }
+                entry.totalBytes = transfer.total.coerceAtLeast(0)
+
+                // Approve the size from the actual GET before opening the payload file.
+                // Separate HEAD/probe calls added latency and could not be cancelled by Run.
+                val budgetBytes = makeRoom(context, entry, target) ?: return
+                if (run.cancelled) return
+                LocalLibrary.writeMeta(entry)
 
                 val raw = FileOutputStream(partFile, downloaded > 0)
                 // Large coalesced writes: the player is reading the same file off the same
@@ -641,6 +655,8 @@ object DownloadEngine {
                     DiagLog.t("http sync-end attempt=${run.attempt} elapsedMs=${(System.nanoTime() - syncAt) / 1_000_000}")
                 }
 
+                if (run.cancelled) return
+                transfer.verifyComplete(downloaded)
                 if (downloaded < MIN_VALID_BYTES) {
                     partFile.delete()
                     throw IllegalStateException("Only $downloaded bytes received")

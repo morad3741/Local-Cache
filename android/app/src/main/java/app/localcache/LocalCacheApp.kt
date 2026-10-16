@@ -5,13 +5,33 @@ import android.util.Log
 import app.localcache.storage.StorageMode
 import app.localcache.storage.UsbDriveDetector
 import java.io.File
+import java.util.concurrent.CountDownLatch
 
 class LocalCacheApp : Application() {
+    private val storageReady = CountDownLatch(1)
+
     override fun onCreate() {
         super.onCreate()
         instance = this
-        healCachePath()
+        // A disconnected or slow USB device must not hold Android's application thread.
+        Thread({
+            try {
+                DiagLog.attach(this)
+                val started = System.nanoTime()
+                DiagLog.i("storage recovery event=begin")
+                healCachePath()
+                DiagLog.i("storage recovery event=end elapsedMs=${(System.nanoTime() - started) / 1_000_000}")
+            } catch (e: Exception) {
+                Log.w(TAG, "cache recovery failed", e)
+                DiagLog.e("storage recovery event=failed exception=${e.javaClass.simpleName} error=${e.message}")
+            } finally {
+                storageReady.countDown()
+            }
+        }, "LocalCache-storage-init").apply { isDaemon = true; start() }
     }
+
+    /** Background callers wait before reading/replacing recovered storage preferences. */
+    fun awaitStorageReady() = storageReady.await()
 
     /**
      * Reattach to the cache folder if the drive came back under a different mount point,

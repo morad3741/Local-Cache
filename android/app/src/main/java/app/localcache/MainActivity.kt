@@ -15,7 +15,6 @@ import app.localcache.model.UsbVolume
 import app.localcache.net.LanAddress
 import app.localcache.net.LanReachability
 import app.localcache.net.PublicIpDetector
-import app.localcache.server.PortFinder
 import app.localcache.server.RequestLog
 import app.localcache.server.ServerManager
 import app.localcache.storage.DiskQuota
@@ -24,8 +23,8 @@ import app.localcache.storage.StorageMode
 import app.localcache.storage.UsbDriveDetector
 import app.localcache.update.UpdateChecker
 import java.io.File
-import java.io.IOException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -49,6 +48,13 @@ class MainActivity : AppCompatActivity() {
     private var serverRunning = false
     private var lastVerifyMessage: String? = null
     private var updateStatus: UpdateChecker.Status? = null
+    private var initialized = false
+    private var storageJob: Job? = null
+    private var storageActionJob: Job? = null
+    private var storageSummaryPath: String? = null
+    private var storageSummary = "Checking storage…"
+    private var storageFolderMissing = false
+    private var storageSummaryAtMs = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,6 +68,20 @@ class MainActivity : AppCompatActivity() {
         ipText = findViewById(R.id.ipText)
         usbText = findViewById(R.id.usbText)
 
+        val buttons = listOf(R.id.btnRefreshIp, R.id.btnPublicIp, R.id.btnHealthCheck,
+            R.id.btnPickUsb, R.id.btnEditConfig, R.id.btnCancelDownload, R.id.btnDeleteCache,
+            R.id.btnStart, R.id.btnStop).map { findViewById<Button>(it) }
+        buttons.forEach { it.isEnabled = false }
+        statusText.text = "Checking storage…"
+        scope.launch {
+            withContext(Dispatchers.IO) { LocalCacheApp.instance.awaitStorageReady() }
+            initialized = true
+            buttons.forEach { it.isEnabled = true }
+            initializeControls()
+        }
+    }
+
+    private fun initializeControls() {
         findViewById<Button>(R.id.btnRefreshIp).setOnClickListener {
             refreshLanIp(showDialogIfMultiple = true)
         }
@@ -159,26 +179,30 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startLocalServer() {
-        if (serverRunning && ServerManager.isRunning()) {
+        val state = CacheRuntime.snapshot().state
+        if (state == SerialLifecycle.State.STARTING) {
+            statusText.text = "Starting server…"
+            return
+        }
+        if (state == SerialLifecycle.State.RUNNING) {
             statusText.text = "Server already running on port ${Prefs.serverPort(this)}"
             return
         }
 
         try {
             statusText.text = "Starting server…"
-            val started = ServerManager.start(this)
             CacheForegroundService.start(this)
-            serverRunning = true
-            statusText.text = buildString {
-                append("Server running on port ${started.port}")
-                started.portNote?.let { append("\n$it") }
-                append("\nOpen ${AppVariant.clientName} and add the install URL below.")
-            }
-            refreshUi()
             // Quiet LAN ping after bind (no dialog) — full report is Health check.
             verifyJob?.cancel()
             verifyJob = scope.launch {
-                delay(800)
+                while (CacheRuntime.snapshot().state != SerialLifecycle.State.RUNNING) {
+                    if (CacheRuntime.snapshot().state == SerialLifecycle.State.FAILED) {
+                        refreshUi()
+                        return@launch
+                    }
+                    delay(200)
+                }
+                refreshUi()
                 val lan = LanReachability.verify(
                     this@MainActivity,
                     port = Prefs.serverPort(this@MainActivity),
@@ -186,12 +210,6 @@ class MainActivity : AppCompatActivity() {
                 lastVerifyMessage = if (lan.ok) "✓ ${lan.message}" else "✗ ${lan.message}"
                 refreshUi()
             }
-        } catch (e: IOException) {
-            Log.e(TAG, "Server start failed", e)
-            serverRunning = false
-            val tried = PortFinder.candidates.joinToString()
-            statusText.text = "Could not start server.\n${e.message}\nPorts tried: $tried"
-            Toast.makeText(this, "Bind failed", Toast.LENGTH_LONG).show()
         } catch (e: Exception) {
             Log.e(TAG, "Server start failed", e)
             serverRunning = false
@@ -200,8 +218,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopLocalServer() {
+        verifyJob?.cancel()
         CacheForegroundService.stop(this)
-        ServerManager.stop()
         serverRunning = false
         lastVerifyMessage = null
         statusText.text = "Server stopped"
@@ -243,6 +261,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshUi() {
+        if (!initialized) return
+        serverRunning = ServerManager.isRunning()
+        refreshStorageSummary()
         val used = Prefs.lanHost(this)
         val port = Prefs.serverPort(this)
         val cfg = AddonConfig.load(this)
@@ -263,6 +284,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         statusText.text = when {
+            CacheRuntime.snapshot().state == SerialLifecycle.State.STARTING -> "Starting server…"
+            CacheRuntime.snapshot().state == SerialLifecycle.State.STOPPING -> "Closing storage…"
+            CacheRuntime.snapshot().state == SerialLifecycle.State.FAILED ->
+                "Server failed: ${CacheRuntime.snapshot().error?.message}"
             !serverRunning ->
                 "Stopped — open this app and tap Start server before using ${AppVariant.clientName}"
             !cfg.hasAnyUpstream() -> "Server running — configure Torrentio/Comet manifests next"
@@ -334,8 +359,8 @@ class MainActivity : AppCompatActivity() {
                 appendLine("Movies save to:")
                 appendLine(cache)
                 appendLine("Config: prefs + ${AddonConfig.CONFIG_FILE_NAME} next to movies")
-                appendLine("Space: ${DiskQuota.summary(this@MainActivity)}")
-                if (!File(cache).isDirectory) {
+                appendLine("Space: $storageSummary")
+                if (storageFolderMissing) {
                     appendLine("This folder no longer exists — tap Choose storage")
                 }
                 appendLine()
@@ -344,6 +369,32 @@ class MainActivity : AppCompatActivity() {
             } else {
                 append("Storage: not selected — tap Choose storage (USB or internal)")
             }
+        }
+    }
+
+    /** At most one scan in flight; status redraws never enumerate or stat the USB. */
+    private fun refreshStorageSummary() {
+        if (storageJob?.isActive == true) return
+        val path = Prefs.cacheDirPath(this)
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (path == storageSummaryPath && now - storageSummaryAtMs < 30_000) return
+        if (path != storageSummaryPath) {
+            storageSummary = "Checking storage…"
+            storageFolderMissing = false
+        }
+        storageJob = scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    DiskQuota.summary(this@MainActivity) to (path != null && !File(path).isDirectory)
+                }.getOrElse { "Could not read storage: ${it.message}" to false }
+            }
+            if (Prefs.cacheDirPath(this@MainActivity) == path) {
+                storageSummaryPath = path
+                storageSummary = result.first
+                storageFolderMissing = result.second
+                storageSummaryAtMs = android.os.SystemClock.elapsedRealtime()
+            }
+            refreshUi()
         }
     }
 
@@ -426,8 +477,10 @@ class MainActivity : AppCompatActivity() {
                     cacheMaxGb = cacheGb.text.toString().toIntOrNull() ?: Prefs.DEFAULT_CACHE_MAX_GB,
                     resultMode = resultMode.text.toString().trim(),
                 )
-                statusText.text = AddonConfig.save(this, snapshot, writeUsb = true)
-                refreshUi()
+                storageTask({ AddonConfig.save(this, snapshot, writeUsb = true) }) { message ->
+                    statusText.text = message
+                    refreshUi()
+                }
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -444,48 +497,56 @@ class MainActivity : AppCompatActivity() {
             .setTitle("Cancel this download?")
             .setMessage(DownloadEngine.statusLine() + "\n\nStopping frees the slot so you can play a different stream.")
             .setPositiveButton("Cancel and delete") { _, _ ->
-                statusText.text = DownloadEngine.cancelActive(deletePartial = true)
-                refreshUi()
+                storageTask({ DownloadEngine.cancelActive(deletePartial = true) }) { message ->
+                    statusText.text = message
+                    refreshUi()
+                }
             }
             .setNeutralButton("Stop but keep file") { _, _ ->
-                statusText.text = DownloadEngine.cancelActive(deletePartial = false)
-                refreshUi()
+                storageTask({ DownloadEngine.cancelActive(deletePartial = false) }) { message ->
+                    statusText.text = message
+                    refreshUi()
+                }
             }
             .setNegativeButton("Keep downloading", null)
             .show()
     }
 
     private fun promptDeleteCache() {
-        val usage = DiskQuota.usage(this)
-        if (usage.files == 0) {
-            statusText.text = "Cache is already empty"
-            refreshUi()
-            return
-        }
-
-        val gb = usage.bytes / 1_073_741_824.0
-        AlertDialog.Builder(this)
-            .setTitle("Delete every cached movie?")
-            .setMessage(
-                "%d file%s using %.1f GB will be removed from cache storage. This cannot be undone."
-                    .format(usage.files, if (usage.files == 1) "" else "s", gb),
-            )
-            .setPositiveButton("Delete everything") { _, _ ->
-                DownloadEngine.cancelActive(deletePartial = true)
-                val wiped = DiskQuota.deleteAll(this)
-                statusText.text = if (wiped.failed > 0) {
-                    "Deleted ${wiped.deleted}, but ${wiped.failed} could not be removed"
-                } else {
-                    "Deleted %d file%s, freed %.1f GB".format(
-                        wiped.deleted,
-                        if (wiped.deleted == 1) "" else "s",
-                        wiped.freedBytes / 1_073_741_824.0,
-                    )
-                }
+        storageTask({ DiskQuota.usage(this) }) { usage ->
+            if (usage.files == 0) {
+                statusText.text = "Cache is already empty"
                 refreshUi()
+                return@storageTask
             }
-            .setNegativeButton("Keep them", null)
-            .show()
+
+            val gb = usage.bytes / 1_073_741_824.0
+            AlertDialog.Builder(this)
+                .setTitle("Delete every cached movie?")
+                .setMessage(
+                    "%d file%s using %.1f GB will be removed from cache storage. This cannot be undone."
+                        .format(usage.files, if (usage.files == 1) "" else "s", gb),
+                )
+                .setPositiveButton("Delete everything") { _, _ ->
+                    storageTask({
+                        DownloadEngine.cancelActive(deletePartial = true)
+                        DiskQuota.deleteAll(this)
+                    }) { wiped ->
+                        statusText.text = if (wiped.failed > 0) {
+                            "Deleted ${wiped.deleted}, but ${wiped.failed} could not be removed"
+                        } else {
+                            "Deleted %d file%s, freed %.1f GB".format(
+                                wiped.deleted,
+                                if (wiped.deleted == 1) "" else "s",
+                                wiped.freedBytes / 1_073_741_824.0,
+                            )
+                        }
+                        refreshUi()
+                    }
+                }
+                .setNegativeButton("Keep them", null)
+                .show()
+        }
     }
 
     private fun showIpPicker(addresses: List<LanAddress>) {
@@ -563,123 +624,155 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun promptUsbSelection(force: Boolean) {
-        val drives = UsbDriveDetector.scan(this)
-
-        when {
-            drives.isEmpty() -> {
-                statusText.text = "No USB drive detected"
-                if (force || Prefs.cacheDirPath(this) == null) {
-                    AlertDialog.Builder(this)
-                        .setTitle("Choose storage")
-                        .setMessage(
-                            "No USB found.\n\n" +
-                                "USB is recommended. Internal storage is a fallback.\n\n" +
-                                StorageMode.LIMITATIONS,
-                        )
-                        .setPositiveButton("Use internal storage") { _, _ -> tryEnableInternal() }
-                        .setNegativeButton("Cancel", null)
-                        .show()
+        storageTask({ UsbDriveDetector.scan(this) }) { drives ->
+            when {
+                drives.isEmpty() -> {
+                    statusText.text = "No USB drive detected"
+                    if (force || Prefs.cacheDirPath(this) == null) {
+                        AlertDialog.Builder(this)
+                            .setTitle("Choose storage")
+                            .setMessage(
+                                "No USB found.\n\n" +
+                                    "USB is recommended. Internal storage is a fallback.\n\n" +
+                                    StorageMode.LIMITATIONS,
+                            )
+                            .setPositiveButton("Use internal storage") { _, _ -> tryEnableInternal() }
+                            .setNegativeButton("Cancel", null)
+                            .show()
+                    }
                 }
-            }
 
-            drives.size == 1 -> confirmSingleDrive(drives.first())
-            else -> showDrivePicker(drives)
+                drives.size == 1 -> confirmSingleDrive(drives.first())
+                else -> showDrivePicker(drives)
+            }
         }
     }
 
     private fun tryEnableInternal() {
-        val result = StorageMode.enableInternal(this)
-        statusText.text = result.message
-        AlertDialog.Builder(this)
-            .setTitle(if (result.ok) "Internal storage" else "Cannot use internal storage")
-            .setMessage(result.message)
-            .setPositiveButton("OK", null)
-            .show()
-        refreshUi()
-    }
-
-    private fun confirmSingleDrive(drive: UsbVolume) {
-        val cacheDir = UsbDriveDetector.resolveWritableCacheDir(this, drive.path)
-        val fs = UsbDriveDetector.mountInfo(drive.path)?.fsType ?: "unknown"
-        AlertDialog.Builder(this)
-            .setTitle("Use this USB drive?")
-            .setMessage(
-                "${drive.label}\n${drive.path}\nFilesystem: $fs\n\n" +
-                    "Movies → ${cacheDir.absolutePath}\n" +
-                    "Config → ${AddonConfig.CONFIG_FILE_NAME} on the USB " +
-                    "(USB root if your PC can write it; otherwise next to the movies folder)\n\n" +
-                    "Or use internal storage (fallback — lower quality, TV may struggle).",
-            )
-            .setPositiveButton("Yes — USB") { _, _ -> applyUsbChoice(drive) }
-            .setNeutralButton("Use internal") { _, _ -> tryEnableInternal() }
-            .setNegativeButton("Not now", null)
-            .show()
-    }
-
-    private fun showDrivePicker(drives: List<UsbVolume>) {
-        val labels = drives.map { drive ->
-            val fs = UsbDriveDetector.mountInfo(drive.path)?.fsType ?: "?"
-            "${drive.label} ($fs)\n${drive.path}"
-        }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("Choose USB drive")
-            .setItems(labels) { _, which -> applyUsbChoice(drives[which]) }
-            .setNeutralButton("Use internal") { _, _ -> tryEnableInternal() }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    private fun applyUsbChoice(drive: UsbVolume) {
-        val cacheDir = UsbDriveDetector.resolveWritableCacheDir(this, drive.path)
-        val check = UsbDriveDetector.checkCacheDir(cacheDir)
-
-        if (!check.writable) {
-            val explanation = if (check.readOnlyMount) {
-                "The drive is mounted read-only. Eject safely from a computer, then replug."
-            } else {
-                "Android refused the write.\n\n${check.rawError}"
-            }
+        storageTask({ StorageMode.enableInternal(this) }) { result ->
+            statusText.text = result.message
             AlertDialog.Builder(this)
-                .setTitle("Cannot write to USB")
-                .setMessage("${cacheDir.absolutePath}\n\nFormat: ${check.fsType ?: "unknown"}\n\n$explanation")
-                .setPositiveButton("OK", null)
-                .show()
-            return
-        }
-
-        if (check.fileSizeTooSmall) {
-            val fsLabel = check.fsType?.uppercase() ?: "FAT32"
-            AlertDialog.Builder(this)
-                .setTitle("Format this drive as exFAT")
-                .setMessage(
-                    "This USB is $fsLabel (max ~${check.maxFileGb?.toInt() ?: 4} GB per file). " +
-                        "Movie files are usually larger, so caching will fail.\n\n" +
-                        "Do this on a computer (the TV app cannot format the drive safely):\n" +
-                        "1. Plug the drive into a PC\n" +
-                        "2. Back up anything you need\n" +
-                        "3. Format as exFAT\n" +
-                        "4. Plug it back into the TV and Choose storage again",
-                )
-                .setPositiveButton("OK", null)
-                .setNeutralButton("Use anyway") { _, _ -> saveUsbChoice(drive) }
-                .show()
-            return
-        }
-
-        saveUsbChoice(drive)
-    }
-
-    private fun saveUsbChoice(drive: UsbVolume) {
-        val result = StorageMode.selectUsb(this, drive.path)
-        statusText.text = result.message
-        if (!result.ok) {
-            AlertDialog.Builder(this)
-                .setTitle("USB setup failed")
+                .setTitle(if (result.ok) "Internal storage" else "Cannot use internal storage")
                 .setMessage(result.message)
                 .setPositiveButton("OK", null)
                 .show()
+            refreshUi()
         }
-        refreshUi()
+    }
+
+    private fun confirmSingleDrive(drive: UsbVolume) {
+        storageTask({
+            UsbDriveDetector.resolveWritableCacheDir(this, drive.path) to
+                (UsbDriveDetector.mountInfo(drive.path)?.fsType ?: "unknown")
+        }) { (cacheDir, fs) ->
+            AlertDialog.Builder(this)
+                .setTitle("Use this USB drive?")
+                .setMessage(
+                    "${drive.label}\n${drive.path}\nFilesystem: $fs\n\n" +
+                        "Movies → ${cacheDir.absolutePath}\n" +
+                        "Config → ${AddonConfig.CONFIG_FILE_NAME} on the USB " +
+                        "(USB root if your PC can write it; otherwise next to the movies folder)\n\n" +
+                        "Or use internal storage (fallback — lower quality, TV may struggle).",
+                )
+                .setPositiveButton("Yes — USB") { _, _ -> applyUsbChoice(drive) }
+                .setNeutralButton("Use internal") { _, _ -> tryEnableInternal() }
+                .setNegativeButton("Not now", null)
+                .show()
+        }
+    }
+
+    private fun showDrivePicker(drives: List<UsbVolume>) {
+        storageTask({
+            drives.map { drive ->
+                val fs = UsbDriveDetector.mountInfo(drive.path)?.fsType ?: "?"
+                "${drive.label} ($fs)\n${drive.path}"
+            }.toTypedArray()
+        }) { labels ->
+            AlertDialog.Builder(this)
+                .setTitle("Choose USB drive")
+                .setItems(labels) { _, which -> applyUsbChoice(drives[which]) }
+                .setNeutralButton("Use internal") { _, _ -> tryEnableInternal() }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+    }
+
+    private fun applyUsbChoice(drive: UsbVolume) {
+        storageTask({
+            val dir = UsbDriveDetector.resolveWritableCacheDir(this, drive.path)
+            dir to UsbDriveDetector.checkCacheDir(dir)
+        }) { (cacheDir, check) ->
+            if (!check.writable) {
+                val explanation = if (check.readOnlyMount) {
+                    "The drive is mounted read-only. Eject safely from a computer, then replug."
+                } else {
+                    "Android refused the write.\n\n${check.rawError}"
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("Cannot write to USB")
+                    .setMessage("${cacheDir.absolutePath}\n\nFormat: ${check.fsType ?: "unknown"}\n\n$explanation")
+                    .setPositiveButton("OK", null)
+                    .show()
+                return@storageTask
+            }
+
+            if (check.fileSizeTooSmall) {
+                val fsLabel = check.fsType?.uppercase() ?: "FAT32"
+                AlertDialog.Builder(this)
+                    .setTitle("Format this drive as exFAT")
+                    .setMessage(
+                        "This USB is $fsLabel (max ~${check.maxFileGb?.toInt() ?: 4} GB per file). " +
+                            "Movie files are usually larger, so caching will fail.\n\n" +
+                            "Do this on a computer (the TV app cannot format the drive safely):\n" +
+                            "1. Plug the drive into a PC\n" +
+                            "2. Back up anything you need\n" +
+                            "3. Format as exFAT\n" +
+                            "4. Plug it back into the TV and Choose storage again",
+                    )
+                    .setPositiveButton("OK", null)
+                    .setNeutralButton("Use anyway") { _, _ -> saveUsbChoice(drive) }
+                    .show()
+                return@storageTask
+            }
+
+            saveUsbChoice(drive)
+        }
+    }
+
+    private fun saveUsbChoice(drive: UsbVolume) {
+        storageTask({ StorageMode.selectUsb(this, drive.path) }) { result ->
+            statusText.text = result.message
+            if (!result.ok) {
+                AlertDialog.Builder(this)
+                    .setTitle("USB setup failed")
+                    .setMessage(result.message)
+                    .setPositiveButton("OK", null)
+                    .show()
+            }
+            refreshUi()
+        }
+    }
+
+    /** USB probes, config writes and deletion are explicit actions, also off the UI thread. */
+    private fun <T> storageTask(work: () -> T, show: (T) -> Unit) {
+        if (storageActionJob?.isActive == true) {
+            statusText.text = "A storage operation is still in progress…"
+            return
+        }
+        storageActionJob = scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { work() }
+                storageActionJob = null
+                storageSummaryAtMs = -30_000
+                show(result)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                storageActionJob = null
+                Log.e(TAG, "Storage action failed", e)
+                statusText.text = "Storage operation failed: ${e.message}"
+            }
+        }
     }
 
     companion object {

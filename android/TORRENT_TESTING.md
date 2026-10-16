@@ -20,6 +20,11 @@ or playback stability on the actual TCL C8K.
   invalidates old readable snapshots and progress high-water marks.
 - Cancellation/replacement joins the preceding worker including its teardown and
   deferred deletion. Failed storage closure blocks further mutation.
+- The foreground service owns an asynchronous, serialized process lifecycle. Stop
+  fences new download admission, cancels HTTP/native workers, joins the entire
+  predecessor chain, then closes libtorrent before a replacement can start. Old
+  service generations cannot stop their replacements. A failed close is retried
+  before new startup. No native destruction runs on the Android main thread.
 - Quota reserves logical size, while physical space reserves the unwritten
   allocation measured with `st_blocks * 512`. Unknown allocation conservatively
   reserves the full file. After eviction, re-read real usable space rather than
@@ -52,6 +57,19 @@ the original eight-hour timeout. Actual TV standby and long-duration behavior re
 device acceptance work. HTTP's 90-second read timeout measures inactivity, not total
 download duration.
 
+USB recovery, server startup/trim and explicit TV storage probes/config/deletion
+run in the background. UI status reads never wait on the server lifecycle monitor.
+Space summaries use one background scan at most every 30 seconds, with no queue of
+overlapping polls. They can therefore lag actual disk usage by up to 30 seconds;
+download approval always reads current space directly.
+
+HTTP downloads approve size from the actual GET response, removing separate
+HEAD/range probes and making header waits cancellable. Identity encoding and
+64-bit Content-Range/length checks protect resume offsets. A shorter successful
+range stays incomplete; a server ignoring Range restarts from zero. Finalization
+requires the advertised response and representation sizes to match received bytes.
+This does not authenticate the content or add persistent ETag validation.
+
 ## Diagnostics
 
 Enable diagnostic logging in `/settings` before reproducing a problem and export
@@ -63,6 +81,8 @@ peer/seed/candidate counts, DHT nodes, tracker failures, peer disconnections,
 native error codes and operations, drive space and periodic memory/network context.
 HTTP logs include DNS resolution, connection/TLS progress, response status and range,
 payload progress, time spent reading the network, buffered writes, flushes and sync.
+Runtime logs mark storage recovery, startup, writer joins and native close, with
+begin/end/error events and elapsed time so an unfinished stage can be identified.
 
 High-volume native events are counted and rate-limited. Torrent progress is sampled
 every 15 seconds after the opening samples. Log lines redact full signed URLs,
@@ -90,6 +110,8 @@ checking/network/rechecking time budgets, offset/hole/seek boundaries, bounded w
 on a 90 GiB small-piece torrent, separate logical/physical space budgets, TV buffer
 limits, credential redaction, and finalization/path preservation including a sparse
 97 GiB file. It does not transfer a real 90 GiB payload.
+The same command also runs **5 blocked-backend lifecycle scenarios** and **11 HTTP
+size/range cases**, including a 90 GiB representation and malformed resume responses.
 
 A controlled recheck regression was run against the original PR's
 `TorrentProgress.java`: it rejected healthy new progress at minute 13. The identical
@@ -105,16 +127,19 @@ bash ./gradlew :app:connectedPersonalDebugAndroidTest
 ```
 
 The Gradle wrapper is pinned to 8.13 for AGP 8.13.2. The normal JVM suite includes
-the policy runner and five registry regressions. Eight opt-in Linux x86_64 JNI
+the policy runner, five registry regressions and two lifecycle/HTTP policy runners.
+Eight opt-in Linux x86_64 JNI
 tests run the production engine against a synthetic local seeder: approval gating,
 mapped nonzero-offset/shared pieces, sparse/corrupt resume, path collisions,
 cancellation in metadata/setup/payload, shutdown/retry and repeated alert/storage
 release. The host native artifact is explicitly extracted and selected through
 `libtorrent4j.jni.path`; it never enters the APK.
 
-Four Android API 34 instrumentation tests cover active-writer wipe protection,
+Seven Android API 34 instrumentation tests cover active-writer wipe protection,
 deferred deletion, rapid A → B → A replacement, cached torrent playback with new
-torrents disabled, and concurrent bounded/redacted diagnostic persistence. The
+torrents disabled, concurrent bounded/redacted diagnostic persistence, cancellation
+of a GET with stalled headers and restart fencing, incomplete successful ranges,
+and preservation of a partial when the resume offset is wrong. The
 `personal` flavor supplies the emulator ABI.
 
 The PR's **Torrent validation** workflow runs JVM/build/lint/JNI checks and Android
@@ -147,8 +172,7 @@ read and write with files above 4 GiB; do not infer exFAT/NTFS support from a br
 5. Test an overnight transfer exceeding eight hours and TV standby/wake. Capture
    sanitized Android crash/ANR traces if the original black screen recurs.
 
-Fast Resume persistence, recursive historical-directory/orphan cleanup, comprehensive
-nested quota accounting and blocking startup/service-shutdown paths remain separate
-work. The black screen's cause and the TV's maximum USB/network throughput remain
+Fast Resume persistence, recursive historical-directory/orphan cleanup and comprehensive
+nested quota accounting remain separate work. The black screen's cause and the TV's maximum USB/network throughput remain
 unconfirmed. Keep this PR Draft until the remaining device acceptance gaps are
 explicitly reviewed; host/emulator checks alone do not verify the TCL fix.

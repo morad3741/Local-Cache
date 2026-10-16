@@ -11,6 +11,7 @@ import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
+import okhttp3.mockwebserver.SocketPolicy
 import okio.Buffer
 import org.junit.After
 import org.junit.Assert.*
@@ -22,6 +23,8 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 
 /** Real HTTP/coroutine/filesystem lifecycle on a dedicated Android test device. */
 @RunWith(AndroidJUnit4::class)
@@ -46,6 +49,7 @@ class DownloadLifecycleTest {
         root = File(base.cacheDir, scope).apply { check(mkdir()) }
         Prefs.setCacheDirPath(context, root.absolutePath)
         Prefs.setCacheMaxGb(context, 2)
+        DownloadEngine.resumeAfterShutdown()
         server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
@@ -67,8 +71,76 @@ class DownloadLifecycleTest {
         DiagLog.setEnabled(context, false)
         DownloadEngine.cancelActive(deletePartial = false)
         await("worker closed", 15_000) { !DownloadEngine.isBusy() }
+        DownloadEngine.resumeAfterShutdown()
         server.shutdown()
         root.deleteRecursively() // Owned test directory only, after the real worker is done.
+    }
+
+    @Test
+    fun shutdownCancelsAStalledGetAndFencesReplacementWriters() {
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse =
+                MockResponse().setBody(Buffer().write(ByteArray(bodySize)))
+                    .setSocketPolicy(SocketPolicy.NO_RESPONSE)
+        }
+        val entry = register("headers")
+        entry.totalBytes = 0 // Previously entered the separate, unowned HEAD/probe path.
+        DownloadEngine.ensureStarted(context, entry.cacheKey)
+        val request = server.takeRequest(5, TimeUnit.SECONDS)!!
+        assertEquals("GET", request.method)
+        val tail = DownloadEngine.pauseForShutdown()
+        val replacement = register("b")
+        DownloadEngine.ensureStarted(context, replacement.cacheKey)
+        runBlocking { withTimeout(5_000) { tail?.join() } }
+        assertFalse(DownloadEngine.isBusy())
+        assertFalse(File(entry.filePath!!).exists())
+        assertFalse(File(replacement.filePath!!).exists())
+        assertEquals(1, server.requestCount)
+        assertEquals("paused", entry.status)
+
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse =
+                MockResponse().setBody(Buffer().write(ByteArray(bodySize) { 3 }))
+        }
+        DownloadEngine.resumeAfterShutdown()
+        DownloadEngine.ensureStarted(context, replacement.cacheKey)
+        await("restart after closed writer", 15_000) { replacement.status == "complete" && !DownloadEngine.isBusy() }
+        assertArrayEquals(ByteArray(bodySize) { 3 }, File(replacement.filePath!!).readBytes())
+    }
+
+    @Test
+    fun aShortSuccessfulRangeKeepsThePartialInsteadOfPublishingACompleteMovie() {
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = MockResponse()
+                .setResponseCode(206).setHeader("Content-Range", "bytes 0-${bodySize - 1}/${2L * bodySize}")
+                .setBody(Buffer().write(ByteArray(bodySize) { 4 }))
+        }
+        val entry = register("short")
+        DownloadEngine.ensureStarted(context, entry.cacheKey)
+        await("short range rejected", 15_000) { !DownloadEngine.isBusy() }
+        assertEquals("error", entry.status)
+        assertTrue(entry.lastError!!.contains("Incomplete download"))
+        assertFalse(File(entry.filePath!!).exists())
+        assertEquals(bodySize.toLong(), CachePaths.partFile(File(entry.filePath!!)).length())
+    }
+
+    @Test
+    fun aWrongResumeOffsetDoesNotAppendOrTruncateTheExistingPartial() {
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = MockResponse()
+                .setResponseCode(206).setHeader("Content-Range", "bytes 0-${bodySize - 1}/$bodySize")
+                .setBody(Buffer().write(ByteArray(bodySize) { 4 }))
+        }
+        val entry = register("wrong-offset")
+        val part = CachePaths.partFile(File(entry.filePath!!))
+        val sentinel = ByteArray(1024 * 1024) { 7 }
+        part.writeBytes(sentinel)
+        DownloadEngine.ensureStarted(context, entry.cacheKey)
+        await("wrong offset rejected", 15_000) { !DownloadEngine.isBusy() }
+        assertEquals("error", entry.status)
+        assertFalse(File(entry.filePath!!).exists())
+        assertArrayEquals(sentinel, part.readBytes())
+        assertEquals("bytes=${sentinel.size}-", server.takeRequest(5, TimeUnit.SECONDS)!!.getHeader("Range"))
     }
 
     @Test
