@@ -249,6 +249,7 @@ object Prefs {
 
     fun setCacheDirPath(context: Context, path: String) {
         prefs(context).edit().putString("cache_dir_path", path).apply()
+        HardwareDiagnostics.request(context)
     }
 
     fun usbLabel(context: Context): String? =
@@ -265,6 +266,7 @@ object Prefs {
             .putString("usb_label", label)
             .putString("usb_root_path", usbRootPath)
             .apply()
+        HardwareDiagnostics.request(context)
     }
 
     fun setInternalSelection(context: Context, cacheDirPath: String, cacheMaxGb: Int) {
@@ -275,6 +277,7 @@ object Prefs {
             .remove("usb_root_path")
             .putInt("cache_max_gb", cacheMaxGb.coerceIn(1, 4096))
             .apply()
+        HardwareDiagnostics.request(context)
     }
 
     fun clearStorageSelection(context: Context) {
@@ -284,5 +287,6 @@ object Prefs {
             .remove("usb_label")
             .remove("usb_root_path")
             .apply()
+        HardwareDiagnostics.request(context)
     }
 }

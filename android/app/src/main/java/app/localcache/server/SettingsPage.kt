@@ -352,7 +352,8 @@ object SettingsPage {
         Record a detailed download log</label>
     </div>
     <p class="hint">Off by default. Use this if a download fails or never starts. Save, reproduce the problem, then open
-      <a href="/logs">the log page</a> and copy the text. Leave it off day to day — writing every event to the USB stick slows torrents down.</p>
+      <a href="/logs">the log page</a> and copy the text. The export includes TV, firmware and storage details.
+      Logs use bounded internal app storage. Leave detailed logging off when you do not need it.</p>
 
     <label>Cache max (GB)</label>
     <input type="number" name="cacheMaxGb" min="1" max="4096" value="${snapshot.cacheMaxGb}"/>

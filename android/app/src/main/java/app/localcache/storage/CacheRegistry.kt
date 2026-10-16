@@ -7,25 +7,25 @@ import java.util.concurrent.ConcurrentHashMap
 data class CacheEntry(
     val cacheKey: String,
     val url: String,
-    val label: String,
+    @Volatile var label: String,
     val type: String?,
     val id: String?,
     val source: String?,
-    var status: String = "registered",
+    @Volatile var status: String = "registered",
     /**
      * Bytes that can be read from byte 0 onwards. For HTTP that is simply the size of the
      * `.part`; for a torrent the file is sparse and full-length from the start, so only the
      * engine knows how much is really there.
      */
-    var downloadedBytes: Long = 0,
+    @Volatile var downloadedBytes: Long = 0,
     /** Pieces hashed so far. For torrents this is often ahead of [downloadedBytes]. */
-    var verifiedBytes: Long = 0,
-    var totalBytes: Long = 0,
-    var filePath: String? = null,
-    var lastError: String? = null,
-    var lastAccessMs: Long = 0,
+    @Volatile var verifiedBytes: Long = 0,
+    @Volatile var totalBytes: Long = 0,
+    @Volatile var filePath: String? = null,
+    @Volatile var lastError: String? = null,
+    @Volatile var lastAccessMs: Long = 0,
     /** Measured download throughput, so we can tell a slow link from a slow drive. */
-    var bytesPerSec: Long = 0,
+    @Volatile var bytesPerSec: Long = 0,
     /**
      * True when this file was queued by auto-next (not opened in Stremio).
      * Completing an auto-prefetched episode must not chain into the whole season.
@@ -57,7 +57,8 @@ object CacheRegistry {
         )
         // Upgrade a short "Torrentio 4K" label if we now know the real file name.
         if (existing != null && release.length > existing.label.length + 8) {
-            entries[stream.cacheKey] = existing.copy(label = release)
+            // Workers and playback retain this instance. Replacing it loses their live progress.
+            existing.label = release
         }
     }
 
@@ -83,6 +84,7 @@ object CacheRegistry {
         }
         if (item.totalBytes > entry.totalBytes) entry.totalBytes = item.totalBytes
         if (item.complete) entry.status = "complete"
+        if (entry.isTorrent) refreshFromDisk(entry.cacheKey)
     }
 
     fun get(cacheKey: String): CacheEntry? = entries[cacheKey]
@@ -99,6 +101,8 @@ object CacheRegistry {
         val entry = entries[cacheKey] ?: return
         entry.status = "registered"
         entry.downloadedBytes = 0
+        entry.verifiedBytes = 0
+        entry.bytesPerSec = 0
         entry.lastError = null
         entry.filePath = null
     }
@@ -108,6 +112,7 @@ object CacheRegistry {
         entries.values.forEach { entry ->
             entry.status = "registered"
             entry.downloadedBytes = 0
+            entry.verifiedBytes = 0
             entry.totalBytes = 0
             entry.filePath = null
             entry.lastError = null
@@ -133,6 +138,12 @@ object CacheRegistry {
         val final = java.io.File(fp)
         val part = java.io.File("$fp.part")
         when {
+            entry.isTorrent && final.exists() && part.exists() -> {
+                entry.status = "error"
+                entry.lastError = "Both finished and partial torrent cache files exist; keeping both"
+                entry.downloadedBytes = 0
+                entry.verifiedBytes = 0
+            }
             final.exists() -> {
                 entry.status = "complete"
                 entry.downloadedBytes = final.length()

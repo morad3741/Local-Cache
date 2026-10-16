@@ -176,7 +176,7 @@ object StorageMode {
         if (!dir.isDirectory) return 0
         var n = 0
         dir.listFiles()?.forEach { file ->
-            if (file.isFile && file.delete()) n++
+            if (file.isFile && DownloadEngine.deleteIdleFile(file) {}) n++
         }
         return n
     }

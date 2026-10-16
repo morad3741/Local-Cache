@@ -1,0 +1,84 @@
+name: Torrent validation
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: torrent-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;35.0.0'
+          log-accepted-android-sdk-licenses: false
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Policy checks
+        run: bash tools/check-torrent-policy.sh
+      - name: JVM tests, APK, instrumentation compilation and lint
+        id: build
+        working-directory: android
+        run: bash ./gradlew :app:testStandardDebugUnitTest :app:assembleStandardDebug :app:assemblePersonalDebugAndroidTest :app:lintStandardDebug --stacktrace
+      - name: Real seeder JNI regressions
+        if: ${{ !cancelled() }}
+        working-directory: android
+        run: bash ./gradlew -PtorrentNativeTests=true :app:testStandardDebugUnitTest --tests app.localcache.torrent.TorrentNativeTest --rerun-tasks --stacktrace
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: torrent-validation-reports
+          path: |
+            android/app/build/reports/
+            android/app/build/test-results/
+      - name: Upload TV test APK
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-cache-standard-debug
+          path: android/app/build/outputs/apk/standard/debug/*.apk
+
+  android-lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;35.0.0'
+          log-accepted-android-sdk-licenses: false
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Enable emulator acceleration
+        run: sudo chmod 666 /dev/kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          script: cd android && bash ./gradlew :app:connectedPersonalDebugAndroidTest --stacktrace
+      - name: Upload Android test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-lifecycle-reports
+          path: |
+            android/app/build/reports/androidTests/
+            android/app/build/outputs/androidTest-results/

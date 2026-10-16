@@ -9,7 +9,6 @@ import java.io.IOException
 /** One HTTP server for the whole app — picks a free port if needed. */
 object ServerManager {
     private const val TAG = "ServerManager"
-    private const val STOP_WAIT_MS = 800L
 
     @Volatile
     private var server: LocalHttpServer? = null
@@ -23,8 +22,8 @@ object ServerManager {
     @Synchronized
     @Throws(IOException::class)
     fun start(context: Context): StartResult {
+        server?.takeIf { it.isAlive }?.let { return StartResult(it, it.listeningPort, null) }
         stopQuietly()
-        Thread.sleep(STOP_WAIT_MS)
 
         val lanHost = Prefs.lanHost(context)
         DiagLog.attach(context)
@@ -59,7 +58,6 @@ object ServerManager {
                 } catch (_: Exception) {
                 }
                 stopQuietly()
-                Thread.sleep(200)
             }
         }
 
@@ -71,11 +69,9 @@ object ServerManager {
         stopQuietly()
     }
 
-    @Synchronized
     fun isRunning(): Boolean {
-        val active = server?.isAlive == true
-        if (!active) server = null
-        return active
+        // A UI status read must never wait behind USB scans or server shutdown.
+        return server?.isAlive == true
     }
 
     fun activePort(): Int? = server?.listeningPort

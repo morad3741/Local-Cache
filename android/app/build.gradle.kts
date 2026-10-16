@@ -4,6 +4,24 @@ plugins {
 }
 
 val libtorrent4jVersion = "2.1.0-39"
+val torrentNativeTests = providers.gradleProperty("torrentNativeTests").orNull == "true"
+val torrentHostJni = configurations.create("torrentHostJni") {
+    isCanBeConsumed = false
+    isTransitive = false
+}
+val extractTorrentNative = tasks.register<org.gradle.api.tasks.Sync>("extractTorrentNative") {
+    from({ torrentHostJni.map { zipTree(it) } })
+    // The Linux artifact also ships ARM; select the CI host ABI explicitly.
+    include("lib/x86_64/libtorrent4j.so")
+    eachFile { relativePath = org.gradle.api.file.RelativePath(true, name) }
+    includeEmptyDirs = false
+    into(layout.buildDirectory.dir("torrent-native"))
+    doLast {
+        check(layout.buildDirectory.file("torrent-native/libtorrent4j.so").get().asFile.isFile) {
+            "Linux x86_64 libtorrent JNI binary was not extracted"
+        }
+    }
+}
 
 android {
     namespace = "app.localcache"
@@ -14,8 +32,9 @@ android {
         applicationId = "app.localcache.release"
         minSdk = 24
         targetSdk = 34
-        versionCode = 80
-        versionName = "0.5.8"
+        versionCode = 81
+        versionName = "0.5.9"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("boolean", "WUPLAY_MODE", "false")
         buildConfigField("String", "PREFS_FILE", "\"local_cache_release\"")
         buildConfigField("int", "DEFAULT_PORT", "7100")
@@ -31,6 +50,25 @@ android {
 
     buildFeatures {
         buildConfig = true
+    }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+        unitTests.all {
+            if (torrentNativeTests) {
+                it.dependsOn(extractTorrentNative)
+                // libtorrent4j calls System.loadLibrary; a native jar on classpath alone
+                // does not extract/load the host binary.
+                it.systemProperty("libtorrent4j.jni.path", layout.buildDirectory.file("torrent-native/libtorrent4j.so").get().asFile.absolutePath)
+            }
+            it.testLogging {
+                events("passed", "skipped", "failed")
+                exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+            }
+            it.useJUnit {
+                if (!torrentNativeTests) excludeCategories("app.localcache.torrent.NativeIntegration")
+            }
+        }
     }
 
     flavorDimensions += "audience"
@@ -100,7 +138,24 @@ android {
     }
 }
 
+configurations.configureEach {
+    if (torrentNativeTests && name.endsWith("UnitTestRuntimeClasspath")) {
+        // Android's Bionic .so files must not shadow the Linux host JNI library.
+        exclude(group = "org.libtorrent4j", module = "libtorrent4j-android-arm64")
+        exclude(group = "org.libtorrent4j", module = "libtorrent4j-android-arm")
+        exclude(group = "org.libtorrent4j", module = "libtorrent4j-android-x86_64")
+    }
+}
+
 dependencies {
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    if (torrentNativeTests) {
+        // Host JNI tests are opt-in and never packaged into the Android APK.
+        add(torrentHostJni.name, "org.libtorrent4j:libtorrent4j-linux:$libtorrent4jVersion")
+    }
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("org.nanohttpd:nanohttpd:2.3.1")

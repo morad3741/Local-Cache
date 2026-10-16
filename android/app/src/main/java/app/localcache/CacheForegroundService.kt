@@ -14,7 +14,6 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import app.localcache.server.ServerManager
 import app.localcache.storage.DownloadEngine
-import app.localcache.torrent.TorrentEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -32,17 +31,21 @@ import kotlinx.coroutines.launch
 class CacheForegroundService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wakeLockAcquiredAtMs = 0L
     private val scope = CoroutineScope(Dispatchers.Main)
     private var notifyJob: Job? = null
+    private var runtimeOwner = 0L
 
     override fun onCreate() {
         super.onCreate()
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "Local Cache",
-            NotificationManager.IMPORTANCE_LOW,
-        )
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Local Cache",
+                NotificationManager.IMPORTANCE_LOW,
+            )
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -65,14 +68,8 @@ class CacheForegroundService : Service() {
 
         acquireWakeLock()
 
-        // The activity normally starts the server first; this covers a restart by Android.
-        if (!ServerManager.isRunning()) {
-            try {
-                ServerManager.start(this)
-            } catch (e: Exception) {
-                Log.e(TAG, "server start failed", e)
-            }
-        }
+        // Enqueue only: storage scans and JNI destruction never run on Android's main thread.
+        runtimeOwner = CacheRuntime.start()
 
         startNotificationUpdates()
         return START_STICKY
@@ -83,8 +80,15 @@ class CacheForegroundService : Service() {
         notifyJob = scope.launch {
             val manager = getSystemService(NotificationManager::class.java)
             while (true) {
+                if (DownloadEngine.isBusy()) acquireWakeLock()
                 val port = ServerManager.activePort() ?: Prefs.serverPort(this@CacheForegroundService)
-                val text = "${DownloadEngine.statusLine()} · port $port"
+                val runtime = CacheRuntime.snapshot()
+                val text = when (runtime.state) {
+                    SerialLifecycle.State.STARTING -> "Starting server…"
+                    SerialLifecycle.State.STOPPING -> "Closing storage…"
+                    SerialLifecycle.State.FAILED -> "Server failed: ${runtime.error?.message}"
+                    else -> "${DownloadEngine.statusLine()} · port $port"
+                }
                 runCatching { manager.notify(NOTIFICATION_ID, buildNotification(text)) }
                 delay(5_000)
             }
@@ -101,12 +105,15 @@ class CacheForegroundService : Service() {
             .build()
 
     private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val pm = getSystemService(PowerManager::class.java) ?: return
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LocalCache::download").apply {
-            setReferenceCounted(false)
-            runCatching { acquire(WAKE_LOCK_TIMEOUT_MS) }
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (wakeLock?.isHeld == true && now - wakeLockAcquiredAtMs < WAKE_LOCK_RENEW_MS) return
+        val held = wakeLock ?: run {
+            val pm = getSystemService(PowerManager::class.java) ?: return
+            pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LocalCache::download").apply {
+                setReferenceCounted(false)
+            }.also { wakeLock = it }
         }
+        runCatching { held.acquire(WAKE_LOCK_TIMEOUT_MS); wakeLockAcquiredAtMs = now }
     }
 
     override fun onDestroy() {
@@ -114,10 +121,7 @@ class CacheForegroundService : Service() {
         scope.cancel()
         runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
         wakeLock = null
-        ServerManager.stop()
-        // The libtorrent session outlives coroutines on its own threads; without this it keeps
-        // the swarm connections (and the radio) alive after the service is gone.
-        runCatching { TorrentEngine.shutdown() }
+        CacheRuntime.stop(runtimeOwner)
         super.onDestroy()
     }
 
@@ -128,6 +132,7 @@ class CacheForegroundService : Service() {
         private val CHANNEL_ID: String get() = BuildConfig.PREFS_FILE
         private const val NOTIFICATION_ID = 1
         private const val WAKE_LOCK_TIMEOUT_MS = 8L * 60 * 60 * 1000
+        private const val WAKE_LOCK_RENEW_MS = 60L * 60 * 1000
 
         fun start(context: Context) {
             val intent = Intent(context, CacheForegroundService::class.java)

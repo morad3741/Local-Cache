@@ -77,7 +77,12 @@ object VideoHandler {
 
         // The click that starts playback is what starts the download.
         CacheRegistry.markAccessed(cacheKey)
-        DownloadEngine.ensureStarted(context, cacheKey)
+        if (!DownloadEngine.ensureStarted(context, cacheKey)) {
+            return json(Status.SERVICE_UNAVAILABLE, org.json.JSONObject()
+                .put("error", "Download unavailable")
+                .put("message", entry.lastError ?: "Server is starting or stopping; retry shortly")
+                .toString()).apply { addHeader("Retry-After", "2") }
+        }
         CacheRegistry.refreshFromDisk(cacheKey)
 
         if (entry.isTorrent) {
@@ -331,7 +336,7 @@ object VideoHandler {
             if (available == null) return 0L
             if (!entry.isTorrent || available.complete) return available.size
             val fromHere = TorrentEngine.readableEndFrom(entry.cacheKey, position)
-            return if (fromHere >= 0) maxOf(fromHere, available.size) else available.size
+            return if (fromHere >= 0) fromHere else available.size
         }
 
         /** Waits for data if the download has not reached this point yet. */
@@ -356,6 +361,7 @@ object VideoHandler {
                     raf.seek(position)
                     val read = raf.read(chunk, 0, want)
                     if (read > 0) {
+                        CacheRegistry.markAccessed(entry.cacheKey)
                         chunkStart = position
                         chunkLength = read
                         return true
@@ -371,6 +377,9 @@ object VideoHandler {
                 if (entry.status in TERMINAL_STATUSES) {
                     Log.i(TAG, "stop serving ${entry.cacheKey}: ${entry.status}")
                     return false
+                }
+                if (entry.isTorrent && TorrentEngine.isChecking(entry.cacheKey)) {
+                    idleSince = System.currentTimeMillis()
                 }
                 if (System.currentTimeMillis() - idleSince > stallTimeoutMs) {
                     Log.w(TAG, "stalled at $position of ${entry.cacheKey}")
@@ -442,6 +451,7 @@ object VideoHandler {
             if (onDisk) {
                 val n = readLocalWaiting(buffer, offset, want)
                 if (n > 0) {
+                    CacheRegistry.markAccessed(entry.cacheKey)
                     position += n
                     remaining -= n
                     return n

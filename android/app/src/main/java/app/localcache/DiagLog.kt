@@ -8,6 +8,10 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * In-memory + on-disk log the viewer can copy from `/logs` on their phone.
@@ -18,7 +22,8 @@ import java.util.TimeZone
 object DiagLog {
     private const val TAG = "LocalCacheDiag"
     private const val MAX_LINES = 900
-    private const val MAX_FILE_BYTES = 512 * 1024L
+    private const val MAX_FILE_BYTES = 1024 * 1024L
+    private val versionIdentity = "appVersion=${BuildConfig.VERSION_NAME} versionCode=${BuildConfig.VERSION_CODE}"
 
     @Volatile
     var enabled: Boolean = false
@@ -26,23 +31,35 @@ object DiagLog {
 
     private val lines = ArrayDeque<String>(MAX_LINES)
     private val lock = Any()
-    private var file: File? = null
-    private var header: String = ""
+    @Volatile private var file: File? = null
+    @Volatile private var header: String = versionIdentity
+    private val pending = ArrayBlockingQueue<Pair<Long, String>>(256)
+    private val generation = AtomicLong()
+    private val dropped = AtomicLong()
+    private val writeFailures = AtomicLong()
+    private var writtenGeneration = 0L // Writer thread only.
+    @Volatile private var previousSession = ""
+    private var loadedPath: String? = null // Writer thread only.
+    private val writer = Executors.newSingleThreadScheduledExecutor { task ->
+        Thread(task, "cache-diagnostic-writer").apply { isDaemon = true }
+    }.apply { scheduleWithFixedDelay({ persist() }, 1, 1, TimeUnit.SECONDS) }
 
     fun attach(context: Context) {
         enabled = Prefs.debugLog(context)
+        DeviceDiagnostics.attach(context)
         header = buildString {
-            append("v").append(BuildConfig.VERSION_NAME)
+            append(versionIdentity)
+            append(" package=").append(BuildConfig.APPLICATION_ID)
+            append(" flavor=").append(BuildConfig.FLAVOR)
+            append(" buildType=").append(BuildConfig.BUILD_TYPE)
             append(" sdk=").append(Build.VERSION.SDK_INT)
             append(" ").append(Build.MANUFACTURER)
             append(" ").append(Build.MODEL)
         }
-        val cache = Prefs.cacheDirPath(context)?.let { File(it) }
-        file = when {
-            cache != null && (cache.isDirectory || cache.mkdirs()) -> File(cache, "local-cache-debug.log")
-            else -> File(context.filesDir, "local-cache-debug.log")
-        }
-        if (enabled) i("debug log attached $header")
+        // Never compete with payload IO or block the alert/UI thread on an unhealthy USB.
+        file = File(context.filesDir, "local-cache-debug.log")
+        HardwareDiagnostics.request(context, force = enabled)
+        if (enabled) i("debug log attached $header ${DeviceDiagnostics.snapshot()}")
     }
 
     fun setEnabled(context: Context, on: Boolean) {
@@ -73,40 +90,76 @@ object DiagLog {
         if (enabled) add("T", msg)
     }
 
-    fun dump(): String = synchronized(lock) {
-        buildString {
-            appendLine("Local Cache diagnostic log")
-            appendLine(header)
-            appendLine("enabled=$enabled lines=${lines.size}")
-            file?.let { appendLine("file=${it.absolutePath}") }
-            appendLine("---")
-            lines.forEach { appendLine(it) }
+    fun dump(): String {
+        val hardware = HardwareDiagnostics.dump()
+        return synchronized(lock) {
+            buildString {
+                appendLine("Local Cache diagnostic log")
+                appendLine(header)
+                appendLine("enabled=$enabled lines=${lines.size} queued=${pending.size} dropped=${dropped.get()} writeFailures=${writeFailures.get()}")
+                file?.let { appendLine("file=${it.absolutePath}") }
+                appendLine("Hardware context:")
+                appendLine(hardware)
+                appendLine("---")
+                if (previousSession.isNotEmpty()) {
+                    appendLine("Previous process (persisted tail):")
+                    appendLine(previousSession)
+                    appendLine("Current process:")
+                }
+                lines.forEach { appendLine(it) }
+            }
         }
     }
 
     fun clear() {
         synchronized(lock) { lines.clear() }
-        file?.let { dest ->
-            runCatching { dest.writeText("") }
-        }
+        generation.incrementAndGet()
+        pending.clear()
+        previousSession = ""
     }
 
     private fun add(level: String, msg: String) {
-        Log.i(TAG, msg)
+        val safe = DiagnosticText.sanitize(msg)
+        Log.i(TAG, "$versionIdentity $safe")
         if (!enabled) return
-        val line = "${ts()} $level $msg"
+        val line = "${ts()} monoMs=${System.nanoTime() / 1_000_000L} $versionIdentity thread=${Thread.currentThread().name} $level $safe"
         synchronized(lock) {
             if (lines.size >= MAX_LINES) lines.removeFirst()
             lines.addLast(line)
         }
+        if (!pending.offer(generation.get() to line)) dropped.incrementAndGet()
+    }
+
+    private fun persist() {
         val dest = file ?: return
         runCatching {
-            dest.appendText(line + "\n")
-            if (dest.length() > MAX_FILE_BYTES) {
-                val kept = dest.readLines().takeLast(500).joinToString("\n", postfix = "\n")
-                dest.writeText(kept)
+            val backup = File(dest.parentFile, "${dest.name}.previous")
+            if (loadedPath != dest.absolutePath) {
+                // Only the background writer reads old logs; keep the export memory bounded.
+                previousSession = listOf(backup, dest).filter { it.isFile && it.length() <= MAX_FILE_BYTES + 128 * 4096 }
+                    .joinToString("\n") { old ->
+                        old.readText().takeLast(128 * 1024).lineSequence()
+                            .joinToString("\n") { DiagnosticText.sanitize(it) }
+                    }.takeLast(256 * 1024)
+                loadedPath = dest.absolutePath
             }
-        }
+            val currentGeneration = generation.get()
+            if (writtenGeneration != currentGeneration) {
+                dest.writeText("")
+                backup.delete()
+                writtenGeneration = currentGeneration
+            }
+            val batch = ArrayList<Pair<Long, String>>(128)
+            pending.drainTo(batch, 128)
+            val text = batch.filter { it.first == currentGeneration }.joinToString("") { it.second + "\n" }
+            if (text.isNotEmpty()) {
+                if (dest.length() + text.toByteArray(Charsets.UTF_8).size > MAX_FILE_BYTES) {
+                    check(!backup.exists() || backup.delete()) { "Cannot rotate diagnostic backup" }
+                    check(!dest.exists() || dest.renameTo(backup)) { "Cannot rotate diagnostic log" }
+                }
+                dest.appendText(text)
+            }
+        }.onFailure { writeFailures.incrementAndGet() }
     }
 
     private fun ts(): String {

@@ -3,6 +3,9 @@ package app.localcache.storage
 import android.content.Context
 import android.util.Log
 import app.localcache.Prefs
+import android.system.Os
+import app.localcache.DiagLog
+import app.localcache.torrent.TorrentEngine
 import java.io.File
 import java.util.Locale
 
@@ -67,6 +70,12 @@ object DiskQuota {
         return runCatching { root.usableSpace }.getOrDefault(0L)
     }
 
+    /** st_blocks is measured in 512-byte units, independently of filesystem block size. */
+    fun allocatedBytes(file: File): Long = if (!file.exists()) 0L else runCatching {
+        val blocks = Os.stat(file.absolutePath).st_blocks
+        if (blocks < 0 || blocks > Long.MAX_VALUE / 512) 0L else minOf(file.length(), blocks * 512)
+    }.getOrDefault(0L) // Unknown allocation must reserve the full file, never trust sparse length.
+
     data class Result(
         val freedBytes: Long,
         val usageBytes: Long,
@@ -79,18 +88,25 @@ object DiskQuota {
      * Files belonging to [keepKeys], to an active download, or watched in the last
      * 15 minutes are left alone.
      */
-    fun ensureSpace(context: Context, requiredBytes: Long, keepKeys: Set<String>): Result {
+    fun ensureSpace(
+        context: Context,
+        requiredBytes: Long,
+        keepKeys: Set<String>,
+        requiredDiskBytes: Long = requiredBytes,
+    ): Result {
         val root = CachePaths.cacheRoot(context) ?: return Result(0, 0, 0, false)
         val quota = effectiveQuotaBytes(context)
         var usage = usageBytes(context)
         var free = freeSpaceOnDrive(context)
         var freed = 0L
+        val headroom = minOf(DRIVE_HEADROOM, (capacityBytes(context) / 20).coerceAtLeast(64L * 1024 * 1024))
 
-        val target = (quota - requiredBytes).coerceAtLeast(0)
+        // An impossible request must not wipe every idle movie before being rejected.
+        if (requiredBytes > quota) return Result(0, usage, StorageBudget.room(quota, usage, free, headroom), false)
 
         // Free space matters as much as the quota: the drive can be full while usage is
         // still under the limit, and then no amount of quota headroom helps.
-        if (usage > target || free < requiredBytes) {
+        if (!StorageBudget.fits(quota, usage, requiredBytes, free, requiredDiskBytes, headroom)) {
             val protectedPaths = protectedPaths(keepKeys)
             val candidates = root.listFiles()
                 ?.filter {
@@ -102,25 +118,30 @@ object DiskQuota {
                 ?: emptyList()
 
             for (file in candidates) {
-                if (usage <= target && free >= requiredBytes) break
+                if (StorageBudget.fits(quota, usage, requiredBytes, free, requiredDiskBytes, headroom)) break
                 val size = file.length()
                 val name = file.name
-                if (file.delete()) {
-                    usage -= size
-                    free += size
-                    freed += size
-                    LocalLibrary.deleteMeta(File(file.absolutePath.removeSuffix(".part")))
-                    forgetByPath(file.absolutePath)
+                if (DownloadEngine.deleteIdleFile(file) {
+                        LocalLibrary.deleteMeta(File(file.absolutePath.removeSuffix(".part")))
+                        forgetByPath(file.absolutePath)
+                    }) {
+                    usage = usageBytes(context)
+                    val measuredFree = freeSpaceOnDrive(context)
+                    freed += (measuredFree - free).coerceAtLeast(0)
+                    free = measuredFree
                     Log.i(TAG, "removed $name (${size / (1024 * 1024)} MB) to make room")
                 }
             }
         }
 
-        val room = minOf(quota - usage, free).coerceAtLeast(0)
+        val room = StorageBudget.room(quota, usage, free, headroom)
         if (freed > 0) {
             Log.i(TAG, "freed ${freed / (1024 * 1024)} MB — now ${usage / GB} / ${quota / GB} GB")
         }
-        return Result(freed, usage, room, room >= requiredBytes)
+        val enough = StorageBudget.fits(quota, usage, requiredBytes, free, requiredDiskBytes, headroom)
+        DiagLog.t("space quota=$quota logical=$usage free=$free headroom=$headroom " +
+            "quotaGrowth=$requiredBytes diskGrowth=$requiredDiskBytes freed=$freed enough=$enough")
+        return Result(freed, usage, room, enough)
     }
 
     /** Trim back under quota, e.g. when the server starts. */
@@ -136,10 +157,17 @@ object DiskQuota {
         var deleted = 0
         var freed = 0L
         var failed = 0
+        val pending = DownloadEngine.pendingPaths()
 
         files.filter { it.isFile }.forEach { file ->
+            if (file.absolutePath in pending || TorrentEngine.storageReleaseError() != null) {
+                failed++
+                return@forEach
+            }
             val size = file.length()
-            if (file.delete()) {
+            if (DownloadEngine.deleteIdleFile(file) {
+                    if (!file.name.endsWith(".meta.json")) forgetByPath(file.absolutePath)
+                }) {
                 if (!file.name.endsWith(".meta.json")) {
                     deleted++
                     freed += size
@@ -149,14 +177,18 @@ object DiskQuota {
             }
         }
 
-        CacheRegistry.all().forEach { CacheRegistry.markEvicted(it.cacheKey) }
         Log.i(TAG, "cache wiped: $deleted file(s), ${freed / (1024 * 1024)} MB")
         return Wipe(deleted, freed, failed)
     }
 
     private fun protectedPaths(keepKeys: Set<String>): Set<String> {
         val now = System.currentTimeMillis()
-        val paths = mutableSetOf<String>()
+        val paths = DownloadEngine.pendingPaths().toMutableSet()
+        if (TorrentEngine.storageReleaseError() != null) {
+            CacheRegistry.all().forEach { entry ->
+                entry.filePath?.let { paths.add(it); paths.add("$it.part") }
+            }
+        }
         CacheRegistry.all().forEach { entry ->
             val busy = entry.status == "downloading" || entry.cacheKey in keepKeys
             val recent = now - entry.lastAccessMs < PROTECT_RECENT_MS
