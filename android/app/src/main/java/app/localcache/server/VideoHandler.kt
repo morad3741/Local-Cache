@@ -77,7 +77,12 @@ object VideoHandler {
 
         // The click that starts playback is what starts the download.
         CacheRegistry.markAccessed(cacheKey)
-        DownloadEngine.ensureStarted(context, cacheKey)
+        if (!DownloadEngine.ensureStarted(context, cacheKey)) {
+            return json(Status.SERVICE_UNAVAILABLE, org.json.JSONObject()
+                .put("error", "Download unavailable")
+                .put("message", entry.lastError ?: "Server is starting or stopping; retry shortly")
+                .toString()).apply { addHeader("Retry-After", "2") }
+        }
         CacheRegistry.refreshFromDisk(cacheKey)
 
         if (entry.isTorrent) {

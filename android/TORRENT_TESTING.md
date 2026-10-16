@@ -25,6 +25,8 @@ or playback stability on the actual TCL C8K.
   predecessor chain, then closes libtorrent before a replacement can start. Old
   service generations cannot stop their replacements. A failed close is retried
   before new startup. No native destruction runs on the Android main thread.
+  Playback requests rejected by admission receive 503 with Retry-After instead
+  of waiting for a worker that was never started.
 - Quota reserves logical size, while physical space reserves the unwritten
   allocation measured with `st_blocks * 512`. Unknown allocation conservatively
   reserves the full file. After eviction, re-read real usable space rather than
@@ -135,11 +137,12 @@ cancellation in metadata/setup/payload, shutdown/retry and repeated alert/storag
 release. The host native artifact is explicitly extracted and selected through
 `libtorrent4j.jni.path`; it never enters the APK.
 
-Seven Android API 34 instrumentation tests cover active-writer wipe protection,
+Eight Android API 34 instrumentation tests cover active-writer wipe protection,
 deferred deletion, rapid A → B → A replacement, cached torrent playback with new
 torrents disabled, concurrent bounded/redacted diagnostic persistence, cancellation
 of a GET with stalled headers and restart fencing, incomplete successful ranges,
-and preservation of a partial when the resume offset is wrong. The
+preservation of a partial when the resume offset is wrong, and a real HTTP 503
+response while download admission is closed. The
 `personal` flavor supplies the emulator ABI.
 
 The PR's **Torrent validation** workflow runs JVM/build/lint/JNI checks and Android

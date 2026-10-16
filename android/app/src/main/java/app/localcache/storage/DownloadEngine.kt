@@ -91,22 +91,23 @@ object DownloadEngine {
         }
     }
 
-    fun ensureStarted(context: Context, cacheKey: String, fromQueue: Boolean = false) {
+    /** False means the caller must answer/retry rather than wait for a worker that wasn't admitted. */
+    fun ensureStarted(context: Context, cacheKey: String, fromQueue: Boolean = false): Boolean {
         appContext = context.applicationContext
-        val entry = CacheRegistry.get(cacheKey) ?: return
-        val target = resolveTarget(context, entry) ?: return
+        val entry = CacheRegistry.get(cacheKey) ?: return false
+        val target = resolveTarget(context, entry) ?: return false
 
         val ctx = context.applicationContext
 
         synchronized(lock) {
-            if (!acceptingDownloads) return
+            if (!acceptingDownloads) return false
             if (!fromQueue) resumeQueue.clear()
 
             // A previously completed file needs no worker and must not interrupt an
             // unrelated transfer. Pending attempts still go through the join below.
             if (target.final.exists() && pendingRuns.none { it.cacheKey == cacheKey }) {
                 CacheRegistry.refreshFromDisk(cacheKey)
-                return
+                return true
             }
 
             if (entry.isTorrent && !Prefs.allowTorrents(ctx)) {
@@ -114,10 +115,10 @@ object DownloadEngine {
                 entry.lastError = "Torrents are turned off in /settings"
                 Log.w(TAG, "refusing magnet ${entry.cacheKey} — torrents disabled")
                 DiagLog.w("refusing magnet ${entry.cacheKey} — torrents disabled")
-                return
+                return true
             }
 
-            if (activeKeyValue == cacheKey && activeRun?.cancelled == false && activeJob?.isActive == true) return
+            if (activeKeyValue == cacheKey && activeRun?.cancelled == false && activeJob?.isActive == true) return true
 
             // Newest request has priority — park whatever was running.
             val previous = stopActiveLocked("paused — another movie was started", deletePartial = false)
@@ -204,6 +205,7 @@ object DownloadEngine {
                     }
                 }
             }
+            return true
         }
     }
 

@@ -7,6 +7,9 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.localcache.Prefs
 import app.localcache.DiagLog
+import app.localcache.server.LocalHttpServer
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -74,6 +77,27 @@ class DownloadLifecycleTest {
         DownloadEngine.resumeAfterShutdown()
         server.shutdown()
         root.deleteRecursively() // Owned test directory only, after the real worker is done.
+    }
+
+    @Test
+    fun aVideoRequestWhileAdmissionIsClosedReturnsRetryable503() {
+        val entry = register("not-admitted")
+        val local = LocalHttpServer(context, "127.0.0.1", 0)
+        try {
+            local.startServer()
+            assertNull(DownloadEngine.pauseForShutdown())
+            OkHttpClient.Builder().readTimeout(5, TimeUnit.SECONDS).build()
+                .newCall(Request.Builder().url("http://127.0.0.1:${local.listeningPort}/video/${entry.cacheKey}").build())
+                .execute().use { response ->
+                    assertEquals(503, response.code)
+                    assertEquals("2", response.header("Retry-After"))
+                }
+            assertFalse(DownloadEngine.isBusy())
+            assertEquals(0, server.requestCount)
+        } finally {
+            local.stop()
+            DownloadEngine.resumeAfterShutdown()
+        }
     }
 
     @Test

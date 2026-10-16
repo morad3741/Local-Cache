@@ -67,10 +67,12 @@ class MainActivity : AppCompatActivity() {
         urlText = findViewById(R.id.urlText)
         ipText = findViewById(R.id.ipText)
         usbText = findViewById(R.id.usbText)
+        // Stop remains usable even if storage recovery is waiting on an unhealthy drive.
+        findViewById<Button>(R.id.btnStop).setOnClickListener { stopLocalServer() }
 
         val buttons = listOf(R.id.btnRefreshIp, R.id.btnPublicIp, R.id.btnHealthCheck,
             R.id.btnPickUsb, R.id.btnEditConfig, R.id.btnCancelDownload, R.id.btnDeleteCache,
-            R.id.btnStart, R.id.btnStop).map { findViewById<Button>(it) }
+            R.id.btnStart).map { findViewById<Button>(it) }
         buttons.forEach { it.isEnabled = false }
         statusText.text = "Checking storage…"
         scope.launch {
