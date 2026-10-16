@@ -6,6 +6,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.concurrent.atomic.AtomicInteger;
+import app.localcache.DiagnosticText;
+import app.localcache.storage.StorageBudget;
 
 /** Dependency-free behavioral checks, also called by the normal Gradle/JUnit suite. */
 public final class TorrentPolicyChecks {
@@ -82,6 +85,74 @@ public final class TorrentPolicyChecks {
             boolean[] bits = new boolean[400];
             Arrays.fill(bits, true);
             equal(16L * 257, TorrentProgress.readableEnd(bits, 0, 6400, 16, 0, 256));
+        });
+        test("90 GiB with small pieces uses bounded JNI reads", () -> {
+            long size = 90L * 1024 * 1024 * 1024, piece = 16 * 1024;
+            int last = (int) ((size - 1) / piece);
+            AtomicInteger reads = new AtomicInteger();
+            long seek = 85L * 1024 * 1024 * 1024;
+            TorrentPieces.Snapshot snapshot = TorrentPieces.sample(i -> { reads.incrementAndGet(); return true; },
+                last + 1, 0, 0, last, 0, size, piece, seek, false);
+            if (reads.get() > TorrentPieces.PREFIX_SCAN_LIMIT + TorrentPieces.LOOKAHEAD + 3)
+                throw new AssertionError("JNI scan grew with movie size: " + reads);
+            equal((long) TorrentPieces.PREFIX_SCAN_LIMIT * piece, snapshot.contiguousBytes);
+            equal(seek + (TorrentPieces.LOOKAHEAD + 1L) * piece, snapshot.readableEnd(seek));
+            equal(seek - piece, snapshot.readableEnd(seek - piece)); // Outside the published seek window.
+        });
+        test("bounded seek snapshot respects offsets and missing pieces", () -> {
+            TorrentPieces.Snapshot snapshot = TorrentPieces.sample(i -> i == 1 || i == 3,
+                5, 0, 0, 4, 13, 60, 16, 40, false);
+            equal(0L, snapshot.contiguousBytes);
+            equal(51L, snapshot.readableEnd(40));
+            equal(0L, snapshot.readableEnd(0));
+            equal(false, snapshot.openingReady);
+        });
+        test("native finished status can publish a large verified prefix without scanning it", () -> {
+            long size = 90L * 1024 * 1024 * 1024, piece = 16 * 1024;
+            int last = (int) ((size - 1) / piece);
+            TorrentPieces.Snapshot snapshot = TorrentPieces.sample(i -> { throw new AssertionError("full scan"); },
+                last + 1, 0, 0, last, 0, size, piece, 0, true);
+            equal(size, snapshot.readableEnd(size - 1));
+            equal(true, snapshot.openingReady && snapshot.tailReady);
+        });
+        test("progress below the old high-water mark after rechecking remains live", () -> {
+            TorrentProgress p = budget();
+            p.sample(0, false, 0, 1_000_000, 1_000_000);
+            p.sample(MINUTE, true, 0, 0, 0);
+            p.sample(2 * MINUTE, true, 500_000, 0, 0);
+            for (int minute = 3; minute < 25; minute++)
+                equal(null, p.sample(minute * MINUTE, false, 0, minute, minute));
+        });
+        test("a 90 GiB sparse resume still reserves unwritten physical bytes", () -> {
+            long gb = 1024L * 1024 * 1024, size = 90 * gb;
+            long quotaGrowth = StorageBudget.remaining(size, size);
+            long diskGrowth = StorageBudget.remaining(size, 4096);
+            equal(0L, quotaGrowth);
+            equal(size - 4096, diskGrowth);
+            equal(false, StorageBudget.fits(120 * gb, size, quotaGrowth, 20 * gb, diskGrowth, 5 * gb));
+            equal(true, StorageBudget.fits(120 * gb, size, quotaGrowth, 100 * gb, diskGrowth, 5 * gb));
+        });
+        test("deleting sparse logical bytes does not invent physical free space", () -> {
+            long gb = 1024L * 1024 * 1024;
+            equal(false, StorageBudget.fits(120 * gb, 0, 90 * gb, 20 * gb, 90 * gb, 5 * gb));
+            equal(false, StorageBudget.fits(80 * gb, 0, 90 * gb, 120 * gb, 90 * gb, 5 * gb));
+            equal(15 * gb, StorageBudget.room(120 * gb, 0, 20 * gb, 5 * gb));
+        });
+        test("TV network buffers stay bounded on small heaps", () -> {
+            TorrentTuning tuning = new TorrentTuning(4L * 1024 * 1024 * 1024, 128L * 1024 * 1024, 4);
+            if ((long) tuning.connections * tuning.receiveBufferBytes + tuning.diskQueueBytes > 32L * 1024 * 1024)
+                throw new AssertionError("Too much network buffer memory for the TV heap");
+            equal(1, tuning.hashingThreads);
+            if (tuning.ioThreads > 2) throw new AssertionError("Too many disk workers for USB playback");
+        });
+        test("diagnostics preserve network hosts and errors while removing credentials", () -> {
+            String safe = DiagnosticText.sanitize("code=401 https://user:password@tracker.test/private-passkey/announce?token=SECRET "
+                + "udp://tracker.test:6969/announce?passkey=HIDDEN magnet:?xt=urn:btih:privatehash&tr=SECRET "
+                + "Authorization: Bearer TOPSECRET\nnext");
+            contains(safe, "tracker.test");
+            contains(safe, "code=401");
+            for (String secret : new String[]{"password", "private-passkey", "SECRET", "HIDDEN", "privatehash", "TOPSECRET", "\n"})
+                if (safe.contains(secret)) throw new AssertionError("Diagnostic leaked " + secret);
         });
         withFiles("final/partial collision keeps both sentinels", root -> {
             Path part = root.resolve("video.part"), target = root.resolve("video.mkv");

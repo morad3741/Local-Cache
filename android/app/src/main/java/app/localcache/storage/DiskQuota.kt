@@ -3,6 +3,8 @@ package app.localcache.storage
 import android.content.Context
 import android.util.Log
 import app.localcache.Prefs
+import android.system.Os
+import app.localcache.DiagLog
 import app.localcache.torrent.TorrentEngine
 import java.io.File
 import java.util.Locale
@@ -68,6 +70,12 @@ object DiskQuota {
         return runCatching { root.usableSpace }.getOrDefault(0L)
     }
 
+    /** st_blocks is measured in 512-byte units, independently of filesystem block size. */
+    fun allocatedBytes(file: File): Long = if (!file.exists()) 0L else runCatching {
+        val blocks = Os.stat(file.absolutePath).st_blocks
+        if (blocks < 0 || blocks > Long.MAX_VALUE / 512) 0L else minOf(file.length(), blocks * 512)
+    }.getOrDefault(0L) // Unknown allocation must reserve the full file, never trust sparse length.
+
     data class Result(
         val freedBytes: Long,
         val usageBytes: Long,
@@ -80,18 +88,24 @@ object DiskQuota {
      * Files belonging to [keepKeys], to an active download, or watched in the last
      * 15 minutes are left alone.
      */
-    fun ensureSpace(context: Context, requiredBytes: Long, keepKeys: Set<String>): Result {
+    fun ensureSpace(
+        context: Context,
+        requiredBytes: Long,
+        keepKeys: Set<String>,
+        requiredDiskBytes: Long = requiredBytes,
+    ): Result {
         val root = CachePaths.cacheRoot(context) ?: return Result(0, 0, 0, false)
         val quota = effectiveQuotaBytes(context)
         var usage = usageBytes(context)
         var free = freeSpaceOnDrive(context)
         var freed = 0L
 
-        val target = (quota - requiredBytes).coerceAtLeast(0)
+        // An impossible request must not wipe every idle movie before being rejected.
+        if (requiredBytes > quota) return Result(0, usage, StorageBudget.room(quota, usage, free, DRIVE_HEADROOM), false)
 
         // Free space matters as much as the quota: the drive can be full while usage is
         // still under the limit, and then no amount of quota headroom helps.
-        if (usage > target || free < requiredBytes) {
+        if (!StorageBudget.fits(quota, usage, requiredBytes, free, requiredDiskBytes, DRIVE_HEADROOM)) {
             val protectedPaths = protectedPaths(keepKeys)
             val candidates = root.listFiles()
                 ?.filter {
@@ -103,26 +117,30 @@ object DiskQuota {
                 ?: emptyList()
 
             for (file in candidates) {
-                if (usage <= target && free >= requiredBytes) break
+                if (StorageBudget.fits(quota, usage, requiredBytes, free, requiredDiskBytes, DRIVE_HEADROOM)) break
                 val size = file.length()
                 val name = file.name
                 if (DownloadEngine.deleteIdleFile(file) {
                         LocalLibrary.deleteMeta(File(file.absolutePath.removeSuffix(".part")))
                         forgetByPath(file.absolutePath)
                     }) {
-                    usage -= size
-                    free += size
-                    freed += size
+                    usage = usageBytes(context)
+                    val measuredFree = freeSpaceOnDrive(context)
+                    freed += (measuredFree - free).coerceAtLeast(0)
+                    free = measuredFree
                     Log.i(TAG, "removed $name (${size / (1024 * 1024)} MB) to make room")
                 }
             }
         }
 
-        val room = minOf(quota - usage, free).coerceAtLeast(0)
+        val room = StorageBudget.room(quota, usage, free, DRIVE_HEADROOM)
         if (freed > 0) {
             Log.i(TAG, "freed ${freed / (1024 * 1024)} MB — now ${usage / GB} / ${quota / GB} GB")
         }
-        return Result(freed, usage, room, room >= requiredBytes)
+        val enough = StorageBudget.fits(quota, usage, requiredBytes, free, requiredDiskBytes, DRIVE_HEADROOM)
+        DiagLog.t("space quota=$quota logical=$usage free=$free headroom=$DRIVE_HEADROOM " +
+            "quotaGrowth=$requiredBytes diskGrowth=$requiredDiskBytes freed=$freed enough=$enough")
+        return Result(freed, usage, room, enough)
     }
 
     /** Trim back under quota, e.g. when the server starts. */

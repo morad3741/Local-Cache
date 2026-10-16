@@ -7,7 +7,7 @@ import java.util.concurrent.ConcurrentHashMap
 data class CacheEntry(
     val cacheKey: String,
     val url: String,
-    val label: String,
+    @Volatile var label: String,
     val type: String?,
     val id: String?,
     val source: String?,
@@ -57,7 +57,8 @@ object CacheRegistry {
         )
         // Upgrade a short "Torrentio 4K" label if we now know the real file name.
         if (existing != null && release.length > existing.label.length + 8) {
-            entries[stream.cacheKey] = existing.copy(label = release)
+            // Workers and playback retain this instance. Replacing it loses their live progress.
+            existing.label = release
         }
     }
 
@@ -100,6 +101,8 @@ object CacheRegistry {
         val entry = entries[cacheKey] ?: return
         entry.status = "registered"
         entry.downloadedBytes = 0
+        entry.verifiedBytes = 0
+        entry.bytesPerSec = 0
         entry.lastError = null
         entry.filePath = null
     }
@@ -109,6 +112,7 @@ object CacheRegistry {
         entries.values.forEach { entry ->
             entry.status = "registered"
             entry.downloadedBytes = 0
+            entry.verifiedBytes = 0
             entry.totalBytes = 0
             entry.filePath = null
             entry.lastError = null

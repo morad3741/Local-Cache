@@ -132,6 +132,7 @@ object DownloadEngine {
                     previous?.join()
 
                     if (run.cancelled) return@launch
+                    app.localcache.DeviceDiagnostics.attach(ctx)
                     TorrentEngine.storageReleaseError()?.let {
                         entry.status = "error"
                         entry.lastError = it
@@ -196,7 +197,7 @@ object DownloadEngine {
                             activeJob = null
                             activeKeyValue = null
                         }
-                        !run.cancelled && entry.status == "complete"
+                        !run.cancelled && activeRun == null && entry.status == "complete"
                     }
                     if (finishedOk) {
                         AutoNextEpisode.onDownloadComplete(ctx, entry)
@@ -467,11 +468,24 @@ object DownloadEngine {
      */
     private fun makeRoom(context: Context, entry: CacheEntry, target: Target): Long? {
         val onDisk = if (target.part.exists()) target.part.length() else 0L
-        val needed = (entry.totalBytes - onDisk).coerceAtLeast(0)
-        val result = DiskQuota.ensureSpace(context, needed, setOf(entry.cacheKey))
+        val mount = UsbDriveDetector.mountInfo(target.part.absolutePath)
+        if (UsbDriveDetector.maxFileSizeGb(mount?.fsType) != null && entry.totalBytes > 0xffff_ffffL) {
+            entry.status = "error"
+            entry.lastError = "This USB filesystem (${mount?.fsType}) cannot store files above 4 GB. " +
+                "Choose a writable filesystem supporting large files."
+            DiagLog.e("storage rejected key=${entry.cacheKey} total=${entry.totalBytes} fs=${mount?.fsType}")
+            return null
+        }
+        val allocated = if (entry.isTorrent) DiskQuota.allocatedBytes(target.part) else onDisk
+        val needed = StorageBudget.remaining(entry.totalBytes, onDisk)
+        val diskNeeded = StorageBudget.remaining(entry.totalBytes, allocated)
+        DiagLog.t("storage approval key=${entry.cacheKey} total=${entry.totalBytes} logical=$onDisk " +
+            "allocated=$allocated fs=${mount?.fsType ?: "unknown"} readOnly=${mount?.readOnly}")
+        val result = DiskQuota.ensureSpace(context, needed, setOf(entry.cacheKey), diskNeeded)
 
-        if (needed > 0 && !result.enough) {
-            val message = "Needs ${gb(needed)} GB but only ${gb(result.roomBytes)} GB " +
+        if (!result.enough) {
+            val message = "Needs ${gb(diskNeeded)} GB of drive space and ${gb(needed)} GB of quota room; " +
+                "only ${gb(result.roomBytes)} GB is available " +
                 "is free after cleanup (limit ${Prefs.cacheMaxGb(context)} GB)"
             Log.e(TAG, "$message — ${entry.cacheKey}")
             entry.status = "error"

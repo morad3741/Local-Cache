@@ -27,6 +27,14 @@ public final class TorrentProgress {
         long elapsed = Math.max(0, now - previousAt);
         previousAt = now;
         if (checking) {
+            if (!wasChecking) {
+                // A recheck invalidates old verified bytes. New progress below the old
+                // high-water mark must still reset the next network stall timer.
+                networkMs = 0;
+                progressAt = 0;
+                mostContiguous = 0;
+                mostVerified = 0;
+            }
             if (!wasChecking || progressPpm > checkProgress) {
                 checkProgressAt = now;
                 checkProgress = progressPpm;
@@ -57,13 +65,19 @@ public final class TorrentProgress {
     /** Uses only the worker's immutable piece snapshot, including nonzero file offsets. */
     public static long readableEnd(boolean[] have, long fileOffset, long fileSize,
                                    long pieceLength, long offset, int lookahead) {
+        return readableEnd(have, 0, fileOffset, fileSize, pieceLength, offset, lookahead);
+    }
+
+    /** Same calculation for a bounded snapshot beginning at an absolute piece index. */
+    public static long readableEnd(boolean[] have, int snapshotFirst, long fileOffset, long fileSize,
+                                   long pieceLength, long offset, int lookahead) {
         if (have == null || pieceLength <= 0 || offset < 0 || offset >= fileSize) return offset;
-        int first = (int) ((fileOffset + offset) / pieceLength);
+        int first = (int) ((fileOffset + offset) / pieceLength) - snapshotFirst;
         if (first < 0 || first >= have.length || !have[first]) return offset;
-        int last = (int) ((fileOffset + fileSize - 1) / pieceLength);
+        int last = (int) ((fileOffset + fileSize - 1) / pieceLength) - snapshotFirst;
         int stop = Math.min(Math.min(last, have.length - 1), first + lookahead);
         int piece = first + 1;
         while (piece <= stop && have[piece]) piece++;
-        return Math.min(fileSize, Math.max(offset, (long) piece * pieceLength - fileOffset));
+        return Math.min(fileSize, Math.max(offset, ((long) piece + snapshotFirst) * pieceLength - fileOffset));
     }
 }

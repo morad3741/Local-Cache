@@ -188,7 +188,7 @@ object UsbDriveDetector {
                 val parts = line.split(" ")
                 if (parts.size < 4) return@mapNotNull null
                 val mountPoint = parts[1].replace("\\040", " ")
-                if (mountPoint == "/" || !path.startsWith(mountPoint)) return@mapNotNull null
+                if (mountPoint == "/" || (path != mountPoint && !path.startsWith("$mountPoint/"))) return@mapNotNull null
                 MountInfo(
                     mountPoint = mountPoint,
                     fsType = parts[2],

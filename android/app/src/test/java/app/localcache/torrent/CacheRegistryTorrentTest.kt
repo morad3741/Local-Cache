@@ -2,6 +2,7 @@ package app.localcache.torrent
 
 import app.localcache.storage.CacheRegistry
 import app.localcache.storage.LocalLibrary
+import app.localcache.model.StreamItem
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.File
@@ -10,6 +11,20 @@ import java.nio.file.Files
 import java.util.UUID
 
 class CacheRegistryTorrentTest {
+    @Test
+    fun improvingALabelPreservesTheWorkersLiveEntry() {
+        val key = UUID.randomUUID().toString()
+        val stream = StreamItem(key, "test", "short", "short", "magnet:?xt=urn:btih:" + "a".repeat(40), isTorrent = true)
+        CacheRegistry.register(stream, "movie", "test")
+        val worker = CacheRegistry.get(key)!!
+        worker.downloadedBytes = 1234
+        CacheRegistry.register(stream.copy(filename = "A much longer synthetic movie release name.mkv"), "movie", "test")
+        assertSame(worker, CacheRegistry.get(key))
+        worker.downloadedBytes = 5678
+        assertEquals(5678L, CacheRegistry.get(key)!!.downloadedBytes)
+        assertTrue(worker.label.contains("synthetic"))
+    }
+
     @Test
     fun rehydrationDoesNotCompleteCollidingTorrentPaths() = withCache { final ->
         final.writeText("keep final")
