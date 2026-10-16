@@ -32,8 +32,8 @@ android {
         applicationId = "app.localcache.release"
         minSdk = 24
         targetSdk = 34
-        versionCode = 80
-        versionName = "0.5.8"
+        versionCode = 81
+        versionName = "0.5.9"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("boolean", "WUPLAY_MODE", "false")
         buildConfigField("String", "PREFS_FILE", "\"local_cache_release\"")

@@ -23,6 +23,7 @@ object DiagLog {
     private const val TAG = "LocalCacheDiag"
     private const val MAX_LINES = 900
     private const val MAX_FILE_BYTES = 1024 * 1024L
+    private val versionIdentity = "appVersion=${BuildConfig.VERSION_NAME} versionCode=${BuildConfig.VERSION_CODE}"
 
     @Volatile
     var enabled: Boolean = false
@@ -31,7 +32,7 @@ object DiagLog {
     private val lines = ArrayDeque<String>(MAX_LINES)
     private val lock = Any()
     @Volatile private var file: File? = null
-    @Volatile private var header: String = ""
+    @Volatile private var header: String = versionIdentity
     private val pending = ArrayBlockingQueue<Pair<Long, String>>(256)
     private val generation = AtomicLong()
     private val dropped = AtomicLong()
@@ -47,7 +48,10 @@ object DiagLog {
         enabled = Prefs.debugLog(context)
         DeviceDiagnostics.attach(context)
         header = buildString {
-            append("v").append(BuildConfig.VERSION_NAME)
+            append(versionIdentity)
+            append(" package=").append(BuildConfig.APPLICATION_ID)
+            append(" flavor=").append(BuildConfig.FLAVOR)
+            append(" buildType=").append(BuildConfig.BUILD_TYPE)
             append(" sdk=").append(Build.VERSION.SDK_INT)
             append(" ").append(Build.MANUFACTURER)
             append(" ").append(Build.MODEL)
@@ -116,9 +120,9 @@ object DiagLog {
 
     private fun add(level: String, msg: String) {
         val safe = DiagnosticText.sanitize(msg)
-        Log.i(TAG, safe)
+        Log.i(TAG, "$versionIdentity $safe")
         if (!enabled) return
-        val line = "${ts()} monoMs=${System.nanoTime() / 1_000_000L} thread=${Thread.currentThread().name} $level $safe"
+        val line = "${ts()} monoMs=${System.nanoTime() / 1_000_000L} $versionIdentity thread=${Thread.currentThread().name} $level $safe"
         synchronized(lock) {
             if (lines.size >= MAX_LINES) lines.removeFirst()
             lines.addLast(line)

@@ -7,6 +7,7 @@ import android.os.Build
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.localcache.Prefs
+import app.localcache.BuildConfig
 import app.localcache.DiagLog
 import app.localcache.HardwareDiagnostics
 import app.localcache.server.LocalHttpServer
@@ -186,6 +187,7 @@ class DownloadLifecycleTest {
         DownloadEngine.ensureStarted(context, entry.cacheKey)
         val request = server.takeRequest(5, TimeUnit.SECONDS)!!
         assertEquals("GET", request.method)
+        assertEquals("LocalCache/${BuildConfig.VERSION_NAME}", request.getHeader("User-Agent"))
         val tail = DownloadEngine.pauseForShutdown()
         val replacement = register("b")
         DownloadEngine.ensureStarted(context, replacement.cacheKey)
@@ -253,6 +255,8 @@ class DownloadLifecycleTest {
         }
         workers.forEach { it.join(5_000); assertFalse("logging caller blocked on IO", it.isAlive) }
         val dump = DiagLog.dump()
+        val versionIdentity = "appVersion=${BuildConfig.VERSION_NAME} versionCode=${BuildConfig.VERSION_CODE}"
+        assertTrue(dump.contains(versionIdentity))
         assertFalse(dump.contains("PASSKEY"))
         assertFalse(dump.contains("SECRET"))
         assertFalse(dump.contains("password"))
@@ -261,6 +265,7 @@ class DownloadLifecycleTest {
         val persisted = File(context.filesDir, "local-cache-debug.log")
         await("asynchronous diagnostic persistence", 10_000) { persisted.length() > 0 }
         assertTrue(persisted.length() <= 1024 * 1024)
+        assertTrue("persisted events have no build version", persisted.readText().contains(versionIdentity))
         assertFalse(File(root, "local-cache-debug.log").exists())
     }
 

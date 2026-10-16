@@ -17,6 +17,7 @@ class LocalCacheApp : Application() {
         Thread({
             try {
                 DiagLog.attach(this)
+                DiagLog.i("app start package=${BuildConfig.APPLICATION_ID} flavor=${BuildConfig.FLAVOR} buildType=${BuildConfig.BUILD_TYPE}")
                 val started = System.nanoTime()
                 DiagLog.i("storage recovery event=begin")
                 healCachePath()

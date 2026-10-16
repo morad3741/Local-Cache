@@ -1,6 +1,7 @@
 package app.localcache.server
 
 import android.util.Log
+import app.localcache.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -30,7 +31,7 @@ object UpstreamProxy {
             val head = Request.Builder()
                 .url(url)
                 .head()
-                .header("User-Agent", "LocalCache-TV/0.1")
+                .header("User-Agent", "LocalCache-TV/${BuildConfig.VERSION_NAME}")
                 .build()
             client.newCall(head).execute().use { response ->
                 if (response.isSuccessful) {
@@ -40,7 +41,7 @@ object UpstreamProxy {
 
             val probe = Request.Builder()
                 .url(url)
-                .header("User-Agent", "LocalCache-TV/0.1")
+                .header("User-Agent", "LocalCache-TV/${BuildConfig.VERSION_NAME}")
                 .header("Range", "bytes=0-0")
                 .build()
             client.newCall(probe).execute().use { response ->
@@ -71,7 +72,7 @@ object UpstreamProxy {
 
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "LocalCache-TV/0.1")
+            .header("User-Agent", "LocalCache-TV/${BuildConfig.VERSION_NAME}")
             .header("Range", rangeHeader)
             .build()
 

@@ -2,6 +2,7 @@ package app.localcache.storage
 
 import android.content.Context
 import android.util.Log
+import app.localcache.BuildConfig
 import app.localcache.Prefs
 import app.localcache.DiagLog
 import app.localcache.torrent.TorrentEngine
@@ -558,7 +559,7 @@ object DownloadEngine {
             val builder = Request.Builder()
                 .url(entry.url)
                 .tag(DownloadTrace::class.java, DownloadTrace(run.attempt, entry.cacheKey))
-                .header("User-Agent", "LocalCache/0.4.17")
+                .header("User-Agent", "LocalCache/${BuildConfig.VERSION_NAME}")
                 .header("Accept-Encoding", "identity")
             if (downloaded > 0) {
                 builder.header("Range", "bytes=$downloaded-")

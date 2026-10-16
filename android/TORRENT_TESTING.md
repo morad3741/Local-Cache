@@ -77,6 +77,13 @@ This does not authenticate the content or add persistent ETag validation.
 Enable diagnostic logging in `/settings` before reproducing a problem and export
 `/logs` afterwards. Logging is opt-in.
 
+This test build is **0.5.9 (version code 81)**. Every diagnostic record in Logcat
+and persisted/exported events includes `appVersion` and `versionCode`, so rolled
+logs remain attributable after an upgrade. The export header and startup event
+also identify the package, flavor and build type. HTTP user agents use the build's
+actual version instead of stale hardcoded values. Startup identity reaches Logcat
+even when detailed recording is off; file persistence remains opt-in.
+
 Every export has a retained hardware-context section, even after ordinary events
 leave the bounded log. It includes the Android-reported TV manufacturer/model,
 product/board/hardware, SoC name on API 31+, Android version and firmware/build/security
