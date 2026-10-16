@@ -124,6 +124,8 @@ PR body is the authority for the exact tested commit and results. The initial re
 caught two Kotlin peer-vector compilation errors; running the previously unexecuted
 JNI suite also exposed the missing host library extraction and a private-torrent
 fixture that disabled the metadata extension it needed to test.
+Loopback peers are assigned to the seeder's global rate-limit class so cancellation
+and shutdown tests cannot accidentally run after an unlimited local transfer finishes.
 
 ## Actual TCL C8K acceptance still required
 

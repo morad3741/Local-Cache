@@ -7,6 +7,7 @@ import org.junit.Assert.*
 import org.junit.Test
 import org.junit.experimental.categories.Category
 import org.libtorrent4j.SessionManager
+import org.libtorrent4j.Address
 import org.libtorrent4j.SessionParams
 import org.libtorrent4j.SettingsPack
 import org.libtorrent4j.TorrentFlags
@@ -148,6 +149,7 @@ class TorrentNativeTest {
         val entry = seededEntry(uploadLimit = 64 * 1024)
         val transfer = download(entry) { true }
         await("first verified payload", 30_000) { entry.verifiedBytes > 0 }
+        assertFalse("fixture finished before shutdown", transfer.isDone)
         TorrentEngine.shutdown()
         assertFalse(transfer.get(10, TimeUnit.SECONDS).ok)
         assertNull(TorrentEngine.storageReleaseError())
@@ -227,6 +229,13 @@ class TorrentNativeTest {
         }
         val params = SessionParams(settings).apply { setPosixDiskIO() }
         manager.start(params)
+        // Local peers otherwise use the unlimited local class, bypassing uploadRateLimit.
+        // Assign loopback to global class 0 (mask 1) before any peer can connect.
+        val classes = manager.swig().get_peer_class_filter()
+        val loopback = Address.parseIp("127.0.0.1")
+        classes.add_rule(loopback.swig(), loopback.swig(), 1L)
+        manager.swig().set_peer_class_filter(classes)
+        classes.delete()
         manager.download(ti, seedDir)
         await("local seeder ready", 10_000) {
             seedHandle = manager.find(ti.infoHash())
