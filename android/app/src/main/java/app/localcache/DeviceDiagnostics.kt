@@ -13,6 +13,19 @@ object DeviceDiagnostics {
 
     fun attach(context: Context) { this.context = context.applicationContext }
 
+    /** Android-reported identity, not a guessed commercial TV/chipset specification. */
+    fun identity(): String = runCatching {
+        val fields = linkedMapOf(
+            "manufacturer" to Build.MANUFACTURER, "brand" to Build.BRAND, "model" to Build.MODEL,
+            "product" to Build.PRODUCT, "device" to Build.DEVICE, "board" to Build.BOARD, "hardware" to Build.HARDWARE,
+            "socManufacturer" to if (Build.VERSION.SDK_INT >= 31) Build.SOC_MANUFACTURER else null,
+            "socModel" to if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else null,
+            "android" to Build.VERSION.RELEASE, "firmwareDisplay" to Build.DISPLAY, "buildId" to Build.ID,
+            "incremental" to Build.VERSION.INCREMENTAL, "securityPatch" to Build.VERSION.SECURITY_PATCH,
+        )
+        "deviceIdentity " + fields.entries.joinToString(" ") { "${it.key}=${HardwareDiagnostics.field(it.value)}" }
+    }.getOrElse { "deviceIdentityError=${it.javaClass.simpleName}" }
+
     fun tuning(): TorrentTuning {
         val memory = memoryInfo()
         return TorrentTuning(memory?.totalMem ?: 0, Runtime.getRuntime().maxMemory(), Runtime.getRuntime().availableProcessors())

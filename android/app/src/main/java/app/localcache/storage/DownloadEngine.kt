@@ -144,6 +144,7 @@ object DownloadEngine {
 
                     if (run.cancelled) return@launch
                     app.localcache.DeviceDiagnostics.attach(ctx)
+                    app.localcache.HardwareDiagnostics.request(ctx)
                     TorrentEngine.storageReleaseError()?.let {
                         entry.status = "error"
                         entry.lastError = it

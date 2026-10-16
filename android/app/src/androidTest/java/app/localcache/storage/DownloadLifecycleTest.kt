@@ -3,10 +3,12 @@ package app.localcache.storage
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
+import android.os.Build
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.localcache.Prefs
 import app.localcache.DiagLog
+import app.localcache.HardwareDiagnostics
 import app.localcache.server.LocalHttpServer
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -24,7 +26,9 @@ import org.junit.runner.RunWith
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -77,6 +81,73 @@ class DownloadLifecycleTest {
         DownloadEngine.resumeAfterShutdown()
         server.shutdown()
         root.deleteRecursively() // Owned test directory only, after the real worker is done.
+    }
+
+    @Test
+    fun hardwareContextSurvivesLogEvictionAndTracksTheSelectedStorage() {
+        DiagLog.setEnabled(context, true)
+        Prefs.setUsbSelection(context, root.absolutePath, "Synthetic memory card A", root.absolutePath)
+        await("first hardware sample", 10_000) {
+            val text = DiagLog.dump()
+            text.contains("hardwareCollection=idle sampleMatchesSelection=true") &&
+                text.contains("label=\"Synthetic memory card A\"") && text.contains("storageSpace totalBytes=")
+        }
+        val initial = DiagLog.dump()
+        assertTrue(initial.contains("model=\"${Build.MODEL}\""))
+        assertTrue(initial.contains("firmwareDisplay="))
+        assertTrue(initial.contains("socModel="))
+        assertTrue(initial.contains("ramTotal="))
+        assertTrue(initial.contains("heapMax="))
+        assertTrue(initial.contains("storageMount point="))
+        assertTrue(initial.contains("usbMassStorage"))
+
+        val missing = File(root, "disconnected-card")
+        Prefs.setUsbSelection(context, missing.absolutePath, "Synthetic memory card B", missing.absolutePath)
+        await("changed storage sample", 10_000) {
+            val text = DiagLog.dump()
+            text.contains("hardwareCollection=idle sampleMatchesSelection=true") &&
+                text.contains("label=\"Synthetic memory card B\"") && text.contains("storagePath exists=false")
+        }
+        repeat(950) { DiagLog.t("evict ordinary event $it") }
+        val exported = DiagLog.dump()
+        assertTrue(exported.contains("Hardware context:"))
+        assertTrue(exported.contains("model=\"${Build.MODEL}\""))
+        assertTrue(exported.contains("label=\"Synthetic memory card B\""))
+        assertFalse("diagnostic collection created a missing storage folder", missing.exists())
+        assertFalse(exported.contains("label=\"Synthetic memory card A\""))
+    }
+
+    @Test
+    fun exportingLogsDoesNotWaitForABlockedStorageInventory() {
+        DiagLog.attach(context)
+        await("baseline hardware sample", 10_000) {
+            HardwareDiagnostics.dump().contains("hardwareCollection=idle sampleMatchesSelection=true")
+        }
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val blocked = object : ContextWrapper(context) {
+            override fun getApplicationContext(): Context = this
+            override fun getSystemService(name: String): Any? {
+                if (name == Context.STORAGE_SERVICE) {
+                    entered.countDown()
+                    check(release.await(10, TimeUnit.SECONDS)) { "test storage inventory timed out" }
+                }
+                return super.getSystemService(name)
+            }
+        }
+        try {
+            HardwareDiagnostics.request(blocked, force = true)
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            val exported = AtomicReference<String>()
+            val reader = thread { exported.set(DiagLog.dump()) }
+            reader.join(1_000)
+            assertFalse("log export blocked on USB inventory", reader.isAlive)
+            assertTrue(exported.get().contains("hardwareCollection=in-progress"))
+            assertTrue(exported.get().contains("ramTotal="))
+        } finally {
+            release.countDown()
+        }
+        await("inventory released", 10_000) { HardwareDiagnostics.dump().contains("hardwareCollection=idle") }
     }
 
     @Test

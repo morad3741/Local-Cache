@@ -77,6 +77,25 @@ This does not authenticate the content or add persistent ETag validation.
 Enable diagnostic logging in `/settings` before reproducing a problem and export
 `/logs` afterwards. Logging is opt-in.
 
+Every export has a retained hardware-context section, even after ordinary events
+leave the bounded log. It includes the Android-reported TV manufacturer/model,
+product/board/hardware, SoC name on API 31+, Android version and firmware/build/security
+patch, ABI/cores and measured RAM/heap. Selected storage includes mode, label/root/path,
+visible filesystem/mount/read-only state, capacity/free/usable bytes and cache limit,
+plus Android volume description/UUID/state/removable/emulated information.
+
+USB mass-storage candidates include vendor/product IDs, manufacturer/product names,
+device release and bus address when Android exposes them. No USB permission prompt,
+connection opening, write probe or serial-number access is used. Public Android APIs
+do not reliably map a USB device to a volume or expose negotiated link speed; logs
+mark these unavailable. A visible FUSE mount does not identify the underlying exFAT
+or NTFS format. SD readers or firmware may hide the physical card's model entirely.
+
+Inventory runs on a separate single background worker, coalesces requests and caches
+samples for up to one minute. Selection changes trigger a new sample. Export shows
+sample age/matching state and pending/unavailable fields; a slow old drive's result
+is never presented as the new selection. It cannot hold up log export or persistence.
+
 Each transfer has a correlation ID. Torrent logs include metadata/setup/teardown
 timings, state and flags, checking progress, readable/verified bytes, throughput,
 peer/seed/candidate counts, DHT nodes, tracker failures, peer disconnections,
@@ -137,13 +156,15 @@ cancellation in metadata/setup/payload, shutdown/retry and repeated alert/storag
 release. The host native artifact is explicitly extracted and selected through
 `libtorrent4j.jni.path`; it never enters the APK.
 
-Eight Android API 34 instrumentation tests cover active-writer wipe protection,
+Ten Android API 34 instrumentation tests cover active-writer wipe protection,
 deferred deletion, rapid A → B → A replacement, cached torrent playback with new
 torrents disabled, concurrent bounded/redacted diagnostic persistence, cancellation
 of a GET with stalled headers and restart fencing, incomplete successful ranges,
 preservation of a partial when the resume offset is wrong, and a real HTTP 503
-response while download admission is closed. The
-`personal` flavor supplies the emulator ABI.
+response while download admission is closed. The hardware cases verify retained
+context after log eviction, read-only sampling of a changed/missing storage path,
+and nonblocking export while storage inventory is blocked. The `personal` flavor
+supplies the emulator ABI.
 
 The PR's **Torrent validation** workflow runs JVM/build/lint/JNI checks and Android
 emulator lifecycle tests, retaining reports as artifacts and the standard debug APK

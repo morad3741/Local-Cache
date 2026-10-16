@@ -31,7 +31,7 @@ object DiagLog {
     private val lines = ArrayDeque<String>(MAX_LINES)
     private val lock = Any()
     @Volatile private var file: File? = null
-    private var header: String = ""
+    @Volatile private var header: String = ""
     private val pending = ArrayBlockingQueue<Pair<Long, String>>(256)
     private val generation = AtomicLong()
     private val dropped = AtomicLong()
@@ -54,6 +54,7 @@ object DiagLog {
         }
         // Never compete with payload IO or block the alert/UI thread on an unhealthy USB.
         file = File(context.filesDir, "local-cache-debug.log")
+        HardwareDiagnostics.request(context, force = enabled)
         if (enabled) i("debug log attached $header ${DeviceDiagnostics.snapshot()}")
     }
 
@@ -85,19 +86,24 @@ object DiagLog {
         if (enabled) add("T", msg)
     }
 
-    fun dump(): String = synchronized(lock) {
-        buildString {
-            appendLine("Local Cache diagnostic log")
-            appendLine(header)
-            appendLine("enabled=$enabled lines=${lines.size} queued=${pending.size} dropped=${dropped.get()} writeFailures=${writeFailures.get()}")
-            file?.let { appendLine("file=${it.absolutePath}") }
-            appendLine("---")
-            if (previousSession.isNotEmpty()) {
-                appendLine("Previous process (persisted tail):")
-                appendLine(previousSession)
-                appendLine("Current process:")
+    fun dump(): String {
+        val hardware = HardwareDiagnostics.dump()
+        return synchronized(lock) {
+            buildString {
+                appendLine("Local Cache diagnostic log")
+                appendLine(header)
+                appendLine("enabled=$enabled lines=${lines.size} queued=${pending.size} dropped=${dropped.get()} writeFailures=${writeFailures.get()}")
+                file?.let { appendLine("file=${it.absolutePath}") }
+                appendLine("Hardware context:")
+                appendLine(hardware)
+                appendLine("---")
+                if (previousSession.isNotEmpty()) {
+                    appendLine("Previous process (persisted tail):")
+                    appendLine(previousSession)
+                    appendLine("Current process:")
+                }
+                lines.forEach { appendLine(it) }
             }
-            lines.forEach { appendLine(it) }
         }
     }
 
