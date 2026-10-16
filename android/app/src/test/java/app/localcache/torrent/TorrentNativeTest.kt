@@ -200,7 +200,9 @@ class TorrentNativeTest {
             hashes.write(MessageDigest.getInstance("SHA-1").digest(all.copyOfRange(offset, minOf(all.size, offset + pieceLength))))
         }
         val info = mapOf(
-            "name" to "fixture", "piece length" to pieceLength, "pieces" to hashes.toByteArray(), "private" to 1,
+            // Private torrents disable libtorrent's ut_metadata extension. A magnet
+            // fixture must permit metadata exchange; discovery is via the loopback x.pe.
+            "name" to "fixture", "piece length" to pieceLength, "pieces" to hashes.toByteArray(), "private" to 0,
             "files" to listOf(
                 mapOf("length" to before.size, "path" to listOf("before.bin")),
                 mapOf("length" to movie.size, "path" to listOf("movie.mkv")),

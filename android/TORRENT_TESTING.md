@@ -118,12 +118,12 @@ torrents disabled, and concurrent bounded/redacted diagnostic persistence. The
 `personal` flavor supplies the emulator ABI.
 
 The PR's **Torrent validation** workflow runs JVM/build/lint/JNI checks and Android
-emulator lifecycle tests, retaining reports as artifacts. Its run linked from the
-PR also retains the standard debug APK as `local-cache-standard-debug` for the TV
-acceptance run. Its run linked from the
+emulator lifecycle tests, retaining reports as artifacts and the standard debug APK
+as `local-cache-standard-debug` for the TV acceptance run. The run linked from the
 PR body is the authority for the exact tested commit and results. The initial review
 caught two Kotlin peer-vector compilation errors; running the previously unexecuted
-JNI suite also exposed the missing host library extraction.
+JNI suite also exposed the missing host library extraction and a private-torrent
+fixture that disabled the metadata extension it needed to test.
 
 ## Actual TCL C8K acceptance still required
 
