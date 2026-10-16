@@ -18,9 +18,11 @@ object CacheRuntime {
             val context = LocalCacheApp.instance
             context.awaitStorageReady()
             DiagLog.attach(context)
-            DownloadEngine.resumeAfterShutdown()
+            DownloadEngine.checkReadyForStartup()
             ServerManager.start(context)
         }
+
+        override fun setAccepting(accepting: Boolean) = DownloadEngine.setAccepting(accepting)
 
         override fun stop() = timed("stop") {
             val context = LocalCacheApp.instance

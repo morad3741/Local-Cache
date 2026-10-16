@@ -21,9 +21,11 @@ public final class SerialLifecycle {
     public interface Backend {
         void start() throws Exception;
         void stop() throws Exception;
+        /** Nonblocking admission flag only; called under the lifecycle monitor. */
+        default void setAccepting(boolean accepting) {}
     }
 
-    // Must be a FIFO, single-worker executor. No backend work runs under this monitor.
+    // Must be a FIFO, single-worker executor. Blocking start/stop never hold this monitor.
     private final Executor executor;
     private final Backend backend;
     private long generation;
@@ -43,6 +45,7 @@ public final class SerialLifecycle {
         if (desired) return generation;
         desired = true;
         long owner = ++generation;
+        backend.setAccepting(false);
         snapshot = new Snapshot(State.STARTING, owner, null);
         executor.execute(() -> doStart(owner));
         return owner;
@@ -53,6 +56,7 @@ public final class SerialLifecycle {
         if (owner != generation || !desired) return;
         desired = false;
         long stopped = ++generation;
+        backend.setAccepting(false);
         snapshot = new Snapshot(State.STOPPING, stopped, null);
         // Never skip an accepted stop: a subsequent start must wait for this barrier.
         executor.execute(() -> doStop(stopped));
@@ -77,6 +81,7 @@ public final class SerialLifecycle {
         synchronized (this) {
             if (owner != generation) return;
             if (failure != null) desired = false;
+            backend.setAccepting(failure == null);
             snapshot = new Snapshot(failure == null ? State.RUNNING : State.FAILED, owner, failure);
         }
     }

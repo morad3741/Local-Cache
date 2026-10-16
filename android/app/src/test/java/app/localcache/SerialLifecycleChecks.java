@@ -9,6 +9,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Controlled blocked backends exercise the same owner used by the foreground service. */
 public final class SerialLifecycleChecks {
@@ -40,14 +41,17 @@ public final class SerialLifecycleChecks {
         ExecutorService caller = Executors.newSingleThreadExecutor();
         CountDownLatch closing = new CountDownLatch(1), closed = new CountDownLatch(1);
         AtomicInteger starts = new AtomicInteger();
+        AtomicBoolean accepting = new AtomicBoolean();
         try {
             SerialLifecycle lifecycle = new SerialLifecycle(worker, new SerialLifecycle.Backend() {
                 public void start() { starts.incrementAndGet(); }
                 public void stop() { closing.countDown(); await(closed); }
+                public void setAccepting(boolean value) { accepting.set(value); }
             });
             long old = lifecycle.start();
             drain(worker);
             lifecycle.stop(old);
+            check(!accepting.get(), "stop did not immediately fence admission");
             check(closing.await(5, TimeUnit.SECONDS), "stop never entered");
             long current = caller.submit(lifecycle::start).get(1, TimeUnit.SECONDS);
             lifecycle.stop(old);
@@ -58,6 +62,9 @@ public final class SerialLifecycleChecks {
             equal(2, starts.get());
             equal(current, lifecycle.snapshot().generation);
             equal(SerialLifecycle.State.RUNNING, lifecycle.snapshot().state);
+            check(accepting.get(), "replacement did not reopen admission");
+            lifecycle.stop(old);
+            check(accepting.get(), "stale service fenced the replacement");
         } finally { closed.countDown(); worker.shutdownNow(); caller.shutdownNow(); }
 
         worker = Executors.newSingleThreadExecutor();

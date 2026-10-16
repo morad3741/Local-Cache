@@ -179,18 +179,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startLocalServer() {
-        val state = CacheRuntime.snapshot().state
-        if (state == SerialLifecycle.State.STARTING) {
-            statusText.text = "Starting server…"
-            return
-        }
-        if (state == SerialLifecycle.State.RUNNING) {
-            statusText.text = "Server already running on port ${Prefs.serverPort(this)}"
-            return
-        }
-
         try {
             statusText.text = "Starting server…"
+            // Always deliver user intent to Android, including Start immediately after Stop.
+            // The runtime owner coalesces duplicate starts after service callbacks arrive.
             CacheForegroundService.start(this)
             // Quiet LAN ping after bind (no dialog) — full report is Health check.
             verifyJob?.cancel()

@@ -46,7 +46,7 @@ object DownloadEngine {
     // pressed play on wins, and the previous download steps aside.
     private val lock = Any()
     private val workers = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var acceptingDownloads = true // Also permits isolated engine tests without a service.
+    @Volatile private var acceptingDownloads = true // Also permits isolated engine tests without a service.
     private var activeJob: Job? = null
     private var activeRun: Run? = null
     private val pendingRuns = mutableSetOf<Run>()
@@ -450,9 +450,16 @@ object DownloadEngine {
         activeJob
     }
 
-    fun resumeAfterShutdown() = synchronized(lock) {
+    /** Lifecycle requests fence admission immediately, even while startup/USB IO is blocked. */
+    fun setAccepting(accepting: Boolean) { acceptingDownloads = accepting }
+
+    fun checkReadyForStartup() = synchronized(lock) {
         check(pendingRuns.isEmpty()) { "Previous download storage is still closing" }
         check(TorrentEngine.storageReleaseError() == null) { "Torrent storage did not close" }
+    }
+
+    fun resumeAfterShutdown() = synchronized(lock) {
+        checkReadyForStartup()
         acceptingDownloads = true
     }
 
