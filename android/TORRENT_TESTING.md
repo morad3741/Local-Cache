@@ -1,33 +1,81 @@
-# Torrent cache fix: validation and remaining work
+# Torrent reliability and TCL C8K USB validation
 
-This is a local draft against `morad3741/Local-Cache:main`, commit
-`895f47c2cf530a6ba1a991bd4313f2c899f11c3c`. It is not a TV-validated fix.
+This PR targets large torrent downloads to USB, including 80–90 GB remux files.
+A passing host/emulator run does not establish throughput, filesystem compatibility,
+or playback stability on the actual TCL C8K.
 
-## Changes under test
+## Storage, cancellation and playback invariants
 
-- Fetch metadata in a fresh empty directory with `UPLOAD_MODE` set and
-  `AUTO_MANAGED` cleared in the add parameters, before the handle exists.
-- Copy the metadata, close/remove its handle, and carry its connected peer endpoints
-  into a fresh payload add. Tracker and explicit magnet peer parameters are preserved.
-  This reconnect step needs native startup-time measurement before release.
-- Supply the selected `.part` path, safe names for skipped files, and file priorities
-  in `add_torrent_params`. The payload handle therefore starts with its storage
-  mapping; no asynchronous `renameFile` operation remains in this flow. Rename-alert
-  success/failure/delay/foreign-event tests are consequently not applicable here.
-- Let the fresh payload add verify existing files normally, with no guessed
-  have-pieces, seed mode, `NO_VERIFY_FILES`, or trusted resume data. Completion requires
-  the selected pieces, native disk closure, and finalization of that mapped file only.
-- Keep checking time separate from network time. A progressing check can exceed five
-  minutes; ten minutes without checking progress fails with a storage message. Network
-  first-data/stall limits remain bounded. Publish no readable piece map while checking.
-- Read worker snapshots on UI/HTTP paths. Keep HTTP playback waiting during checking;
-  the worker owns its progress watchdog. Native/storage errors stop the worker promptly.
-- Keep cancellation teardown and deletion in the worker job. A replacement joins the
-  complete predecessor chain. Wait for the matching disk-closed paused alert and
-  removed handle before reuse. Failure to confirm closure blocks further mutation.
-  Quota/wipe operations also protect pending writers and native auxiliary files.
+- Metadata runs in upload mode with auto-management disabled, before the payload
+  has a handle. Approval uses the selected file's real size.
+- A fresh payload add receives its mapped cache filenames and file priorities in
+  its add parameters. No asynchronous file rename gates network writes.
+- Existing sparse files undergo native verification. Logical length never grants
+  readable bytes or completion. Completion requires verified selected pieces,
+  matching storage-close/removal barriers, and finalization of the mapped file.
+- Native alert handles are borrowed memory. Compare them with the worker-owned
+  handle during the callback, then publish only scalar paused/removed/error state.
+  No borrowed alert handle is retained for a later worker poll.
+- Checking uses a progress watchdog separately from network time. Rechecking
+  invalidates old readable snapshots and progress high-water marks.
+- Cancellation/replacement joins the preceding worker including its teardown and
+  deferred deletion. Failed storage closure blocks further mutation.
+- Quota reserves logical size, while physical space reserves the unwritten
+  allocation measured with `st_blocks * 512`. Unknown allocation conservatively
+  reserves the full file. After eviction, re-read real usable space rather than
+  adding a sparse file's logical length to it. Keep 5% drive headroom, capped at
+  5 GiB, with a 64 MiB minimum. Oversized movies are rejected before eviction.
+- Known FAT32 mounts reject files above 4 GiB before payload transfer. Filesystem
+  detection through Android FUSE is incomplete; a successful large write still
+  needs validation on the TV's firmware.
+- Registry label updates preserve the entry held by the worker. Playback refreshes
+  recent-access protection while reading, including during long HTTP responses.
 
-## Commands and observed results in this environment
+## Work bounded for TV CPU and memory
+
+No CPU/RAM specification is inferred from the model name. Diagnostics record the
+actual model, SDK, ABI, processor count, system RAM, Java heap limit and native heap.
+
+The session uses POSIX disk IO, one download and one checking job. Constrained
+devices use 40 peer connections, a 4 MiB disk queue and 256 KiB maximum receive
+buffer per peer; other devices use 64, 8 MiB and 512 KiB respectively. Peer discovery
+is capped at 2048 entries, metadata at 16 MiB, hashing at one thread and disk IO at
+one or two threads. These are resource limits, not measured TCL performance claims.
+
+Worker piece reads are bounded to a 4096-piece prefix scan and a 1025-piece seek
+snapshot plus opening/cue bits. Piece priority changes use one batched delta instead
+of constructing a vector for every piece in the movie. The seek window advances as
+the HTTP response consumes it; UI/HTTP paths publish offsets and read Java snapshots.
+
+An active transfer renews the bounded wake lock every hour, so it can continue past
+the original eight-hour timeout. Actual TV standby and long-duration behavior remain
+device acceptance work. HTTP's 90-second read timeout measures inactivity, not total
+download duration.
+
+## Diagnostics
+
+Enable diagnostic logging in `/settings` before reproducing a problem and export
+`/logs` afterwards. Logging is opt-in.
+
+Each transfer has a correlation ID. Torrent logs include metadata/setup/teardown
+timings, state and flags, checking progress, readable/verified bytes, throughput,
+peer/seed/candidate counts, DHT nodes, tracker failures, peer disconnections,
+native error codes and operations, drive space and periodic memory/network context.
+HTTP logs include DNS resolution, connection/TLS progress, response status and range,
+payload progress, time spent reading the network, buffered writes, flushes and sync.
+
+High-volume native events are counted and rate-limited. Torrent progress is sampled
+every 15 seconds after the opening samples. Log lines redact full signed URLs,
+tracker path/query passkeys, magnet links and common credential fields, retaining
+hosts, ports and error details.
+
+Persistence uses a bounded background queue and internal app storage, so it cannot
+block an alert callback on USB IO. Two rotating files are capped at 1 MiB each,
+memory retains at most 900 bounded lines, and exports show dropped-line/write-failure
+counters and a sanitized tail from the previous process. Abrupt process death can
+lose the final queued second; rotation intentionally limits retention.
+
+## Automated checks
 
 From the repository root:
 
@@ -37,115 +85,68 @@ bash -n tools/check-torrent-policy.sh
 git diff --check
 ```
 
-**PASS:** 20 dependency-free Java policy/file checks; shell syntax and diff checks
-passed. The Java checks use a controlled monotonic clock and temporary files with
-sentinels, including a sparse file with 97 GiB logical length, collisions, symlinks,
-selected-file offsets, seeks, checking progress, and network stalls. They exercise
-the production `TorrentProgress` and `TorrentFiles` classes, not JNI or Android.
-The runner uses the JDK compiler module and targets Java 17. Its first attempt using
-`--release 17` failed because this environment's trimmed JDK lacks that release's
-symbol data; `-source 17 -target 17` compiled and ran successfully.
+The dependency-free suite runs **29 behavioral checks** against production Java:
+checking/network/rechecking time budgets, offset/hole/seek boundaries, bounded work
+on a 90 GiB small-piece torrent, separate logical/physical space budgets, TV buffer
+limits, credential redaction, and finalization/path preservation including a sparse
+97 GiB file. It does not transfer a real 90 GiB payload.
 
-From `android/`, these commands were attempted:
+A controlled recheck regression was run against the original PR's
+`TorrentProgress.java`: it rejected healthy new progress at minute 13. The identical
+harness passes against the fix.
 
-```sh
-GRADLE_USER_HOME=/workspace/gradle-home bash ./gradlew :app:tasks --all
-GRADLE_USER_HOME=/workspace/gradle-home bash ./gradlew :app:testStandardDebugUnitTest :app:assembleStandardDebug :app:lintStandardDebug
-GRADLE_USER_HOME=/workspace/gradle-home bash ./gradlew -PtorrentNativeTests=true :app:testStandardDebugUnitTest --tests app.localcache.torrent.TorrentNativeTest
-```
-
-All exited **1 during wrapper bootstrap**, before project configuration, while
-downloading `gradle-9.3.0-bin.zip`, with `java.net.SocketException: Operation not
-permitted`. Gradle tasks could not be discovered. The Kotlin/Gradle changes have
-therefore **not been compiled** in this environment.
-
-| Check | Actual result |
-| --- | --- |
-| Dependency-free policy/file suite | PASS, 20 checks |
-| Baseline Gradle tasks/build/tests/lint | NOT RUN; wrapper bootstrap blocked by executor network access |
-| Full Gradle JVM suite, including four registry regressions | NOT RUN; same bootstrap blocker |
-| Linux JNI suite with a real synthetic seeder | NOT RUN; same bootstrap blocker; dependencies unavailable |
-| Android APK build and lint | NOT RUN; same bootstrap blocker; Android SDK tools unavailable |
-| Three Android lifecycle/cached-playback tests | NOT RUN; no SDK, adb, emulator, or attached device |
-| Regression red/green against original TorrentEngine | NOT RUN; requires the native/full app toolchain |
-| TCL SDK 34 + USB playback, seek, responsiveness | NOT RUN; no TV/USB access |
-| Independent review | NOT RUN; self-review only |
-
-Do not treat the passing helper checks as validation of `renamed_files`, upload-mode
-metadata discovery, JNI compatibility, alert ordering, storage closure, connection
-speed, full Kotlin compilation, or TCL playback.
-
-## Running the complete suites
-
-Use a full JDK 17 or newer and Android SDK platform 34 with the build tools required
-by the repository's Android plugin. Install adb and use a dedicated Android test
-device for instrumentation. Run the task discovery command above first.
-
-The normal Gradle unit task runs `TorrentPolicyTest` (the same 20 checks) and four
-`CacheRegistryTorrentTest` cases. JNI tests are excluded by category unless
-`-PtorrentNativeTests=true` is supplied. That opt-in adds the matching Linux x86_64
-native artifact to test runtime and excludes Android Bionic native jars from the
-host unit-test runtime. It does not change APK dependencies.
-
-`TorrentNativeTest` runs the production engine against synthetic multi-file content
-and a loopback seeder. Its selected movie has a nonzero offset and shared boundary
-pieces. Seven cases cover storage approval, diagnostics off, original-path sentinels,
-corrupt/sparse resume, colliding paths, cancellation in metadata/setup/payload, late
-writes, and retry after clean session shutdown. Real network transfer checks use
-short bounded observations; timeout policy tests use the controlled Java clock.
-
-On a dedicated test device:
+With JDK 17 and Android SDK platform 34 / build tools 35.0.0:
 
 ```sh
-bash ./gradlew :app:connectedStandardDebugAndroidTest
+cd android
+bash ./gradlew :app:testStandardDebugUnitTest :app:assembleStandardDebug :app:lintStandardDebug
+bash ./gradlew -PtorrentNativeTests=true :app:testStandardDebugUnitTest --tests app.localcache.torrent.TorrentNativeTest
+bash ./gradlew :app:connectedPersonalDebugAndroidTest
 ```
 
-`DownloadLifecycleTest` uses real Android preferences isolated by name, temporary
-storage, production coroutines/HTTP, and a local MockWebServer. It covers wipe versus
-an active writer, deferred selected deletion, rapid HTTP A -> B -> A switching, and
-playing a finalized torrent with new torrent downloads disabled.
-It does not establish torrent JNI or USB behavior.
+The Gradle wrapper is pinned to 8.13 for AGP 8.13.2. The normal JVM suite includes
+the policy runner and five registry regressions. Eight opt-in Linux x86_64 JNI
+tests run the production engine against a synthetic local seeder: approval gating,
+mapped nonzero-offset/shared pieces, sparse/corrupt resume, path collisions,
+cancellation in metadata/setup/payload, shutdown/retry and repeated alert/storage
+release. The host native artifact is explicitly extracted and selected through
+`libtorrent4j.jni.path`; it never enters the APK.
 
-Before making this release-ready, run the native tests against original `main` and
-the fix with the same test fixtures, record the actual red/green outcomes, and add
-native failure/late-release and cancellation-during-a-long-check coverage. Do not
-mark unexecuted cases as passing. Obtain an independent review of the diff and results.
+Four Android API 34 instrumentation tests cover active-writer wipe protection,
+deferred deletion, rapid A → B → A replacement, cached torrent playback with new
+torrents disabled, and concurrent bounded/redacted diagnostic persistence. The
+`personal` flavor supplies the emulator ABI.
 
-## TCL/USB acceptance run
+The PR's **Torrent validation** workflow runs JVM/build/lint/JNI checks and Android
+emulator lifecycle tests, retaining reports as artifacts. Its run linked from the
+PR also retains the standard debug APK as `local-cache-standard-debug` for the TV
+acceptance run. Its run linked from the
+PR body is the authority for the exact tested commit and results. The initial review
+caught two Kotlin peer-vector compilation errors; running the previously unexecuted
+JNI suite also exposed the missing host library extraction.
 
-Use synthetic or freely licensed content, not personal torrents or logs. Record the
-exact APK versionCode and build commit, TV model/SDK, USB filesystem and free space.
+## Actual TCL C8K acceptance still required
 
-1. Test a small file and large/sparse fixtures, plus a multi-file selection with a
-   nonzero offset. Verify the approved path and selected bytes, and measure time
-   from click to metadata, checking, first playable bytes and stable playback.
-2. Resume a deliberately incomplete/corrupt `.part`. Confirm hash checking occurs,
-   progress is shown separately, no old bytes are exposed, and a check progressing
-   beyond five minutes is allowed. Verify an unplugged/unresponsive drive and a dead
-   swarm produce a clear bounded failure.
-3. Exercise play, tail probes, forward/back seek, peer rediscovery after checking,
-   remote-control navigation, phone settings and notification updates during USB IO.
-4. Cancel/delete during metadata, setup, checking and payload; immediately retry and
-   switch A -> B -> A. Confirm a single writer, no late writes, and preserved sentinel
-   files. Exercise quota cleanup, wipe and storage selection while stopping.
-5. Check HTTP/debrid playback and resume, final-file playback, explicit file choice,
-   and error reporting. Collect sanitized ANR/crash traces if the black screen recurs.
+Record the APK commit/version, full model/firmware/ABI, measured RAM/heap, USB model,
+port, filesystem, capacity and free space. Use a format that this firmware can both
+read and write with files above 4 GiB; do not infer exFAT/NTFS support from a brand name.
 
-## Scope boundaries
+1. Download a small synthetic file, then an 80–90 GB remux to USB. Capture metadata,
+   checking, first readable bytes, sustained payload/write rates, memory pressure
+   and UI responsiveness, with and without playback.
+2. Resume an incomplete/corrupt large file. Confirm normal hash checking, increasing
+   check progress beyond five minutes, no exposure of unchecked bytes, and correct
+   physical free-space reservation. Test a full drive and an unplugged/read-only USB.
+3. Exercise opening/tail probes, forward/back seeks beyond one snapshot window,
+   Ethernet/Wi-Fi disconnect and recovery, unavailable trackers and a dead swarm.
+   Distinguish DNS/connect failures, lack of peers and disk backpressure in the log.
+4. Cancel/delete during metadata, checking and payload, then immediately retry and
+   switch A → B → A. Verify sentinels, a single writer and no late writes.
+5. Test an overnight transfer exceeding eight hours and TV standby/wake. Capture
+   sanitized Android crash/ANR traces if the original black screen recurs.
 
-Fast Resume persistence is not implemented. The JSON sidecar remains metadata only.
-Automatic initial verification can still take substantial time on a large USB file.
-Re-adding the payload reconnects peers; its connection behavior is not yet validated.
-
-Historical original torrent directories and dormant native partfiles are not cleaned
-recursively. Newly mapped skipped paths stay separate from the original metadata
-paths. The draft only deletes its own empty metadata directory. Nested/sparse/physical
-quota accounting and comprehensive orphan cleanup remain separate work; the quota
-changes here protect writers and serialize deletion without changing its size model.
-
-The reported black screen, crash and USB/native performance have not been reproduced.
-Startup storage scans and service shutdown can still perform blocking work; cached
-status/readability do not establish that every UI/lifecycle path is nonblocking.
-
-Keep a PR **Draft** until core build/JVM/native validation and review have run. TV
-validation and any remaining acceptance gaps must be stated explicitly in its body.
+Fast Resume persistence, recursive historical-directory/orphan cleanup, comprehensive
+nested quota accounting and blocking startup/service-shutdown paths remain separate
+work. The black screen's cause and the TV's maximum USB/network throughput remain
+unconfirmed. Keep this PR Draft until the remaining device acceptance gaps are
+explicitly reviewed; host/emulator checks alone do not verify the TCL fix.

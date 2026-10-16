@@ -11,10 +11,16 @@ val torrentHostJni = configurations.create("torrentHostJni") {
 }
 val extractTorrentNative = tasks.register<org.gradle.api.tasks.Sync>("extractTorrentNative") {
     from({ torrentHostJni.map { zipTree(it) } })
-    include("**/libtorrent4j.so")
+    // The Linux artifact also ships ARM; select the CI host ABI explicitly.
+    include("lib/x86_64/libtorrent4j.so")
     eachFile { relativePath = org.gradle.api.file.RelativePath(true, name) }
     includeEmptyDirs = false
     into(layout.buildDirectory.dir("torrent-native"))
+    doLast {
+        check(layout.buildDirectory.file("torrent-native/libtorrent4j.so").get().asFile.isFile) {
+            "Linux x86_64 libtorrent JNI binary was not extracted"
+        }
+    }
 }
 
 android {

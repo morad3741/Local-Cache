@@ -104,6 +104,7 @@ class TorrentNativeTest {
         final.writeBytes(existingFinal)
         val result = download(entry) { fail("storage collision must fail before metadata approval"); false }
             .get(10, TimeUnit.SECONDS)
+        assertNull("collision must be tested with a working native engine", TorrentEngine.nativeError())
         assertFalse(result.ok)
         assertNotEquals("complete", entry.status)
         assertArrayEquals(sentinel, part.readBytes())

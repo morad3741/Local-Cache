@@ -29,6 +29,7 @@ jobs:
       - name: Policy checks
         run: bash tools/check-torrent-policy.sh
       - name: JVM tests, APK, instrumentation compilation and lint
+        id: build
         working-directory: android
         run: bash ./gradlew :app:testStandardDebugUnitTest :app:assembleStandardDebug :app:assemblePersonalDebugAndroidTest :app:lintStandardDebug --stacktrace
       - name: Real seeder JNI regressions
@@ -43,6 +44,12 @@ jobs:
           path: |
             android/app/build/reports/
             android/app/build/test-results/
+      - name: Upload TV test APK
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-cache-standard-debug
+          path: android/app/build/outputs/apk/standard/debug/*.apk
 
   android-lifecycle:
     runs-on: ubuntu-latest
