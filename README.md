@@ -12,7 +12,7 @@ You pick a stream like usual (Torrentio / Comet) — **debrid or torrent, both w
 **No more buffering mid-movie.**  
 Once the file is local, your TV isn’t fighting your internet anymore. Smooth playback. That’s the whole point.
 
-**Latest APK:** [v0.5.8](https://github.com/heroiamarelo1/Local-Cache/releases/tag/v0.5.8)
+**Latest APK:** [v0.5.9](https://github.com/morad3741/Local-Cache/releases/tag/v0.5.9) — version code 81, signed standard debug build. See the release notes for installation and validation details.
 
 ---
 
@@ -46,7 +46,7 @@ Both work. Paste your Torrentio / Comet manifests in `/settings`, check the debr
 
 ## How it works? 🚀
 
-1. 📦 **Sideload the app** on your Android TV / Google TV ([Releases](https://github.com/heroiamarelo1/Local-Cache/releases))
+1. 📦 **Sideload the app** on your Android TV / Google TV ([Releases](https://github.com/morad3741/Local-Cache/releases))
 2. ▶️ **Start the server** in Local Cache — pick USB, or use internal storage if you must
 3. 📱 **Configure on your phone** — same Wi‑Fi, open `TV_IP:7100/settings` (it’s written in the app), paste Torrentio / Comet manifests, check your debrid services, turn on **Torrents** if you want magnets
 4. 🎬 **Add the add-on in Stremio** → `http://127.0.0.1:7100/manifest.json`

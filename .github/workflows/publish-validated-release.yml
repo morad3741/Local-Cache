@@ -1,0 +1,63 @@
+name: Publish validated APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag matching the APK version
+        required: true
+        default: v0.5.9
+      validated_run_id:
+        description: Successful Torrent validation run containing the APK
+        required: true
+        default: '38893764940'
+      target_commit:
+        description: Release commit with the same Git tree as the tested source
+        required: true
+        default: d5c28bb15f03e72efd2f9ee43290bb245cf1a924
+      apk_sha256:
+        description: Expected SHA256 of the validated APK
+        required: true
+        default: d444164ea398d0c060109f62eea7a6cea5c7948416cc58bc6df7972c6c07a57b
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-apk-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      VALIDATED_RUN_ID: ${{ inputs.validated_run_id }}
+      RELEASE_TARGET: ${{ inputs.target_commit }}
+      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify successful tests, source tree and draft release
+        run: python3 tools/publish-validated-release.py verify
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools build-tools;35.0.0'
+          log-accepted-android-sdk-licenses: false
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.validated_run_id }}
+          name: local-cache-standard-debug
+          path: downloaded-apk
+      - name: Verify APK identity and signature, upload checksums and publish
+        run: python3 tools/publish-validated-release.py publish
