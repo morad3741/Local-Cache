@@ -107,6 +107,18 @@ public final class TorrentPolicyChecks {
             equal(0L, snapshot.readableEnd(0));
             equal(false, snapshot.openingReady);
         });
+        test("a seek response advances beyond its initial snapshot without exposing holes", () -> {
+            long size = 90L * 1024 * 1024 * 1024, piece = 16 * 1024;
+            int last = (int) ((size - 1) / piece);
+            long seek = 80L * 1024 * 1024 * 1024;
+            TorrentPieces.Snapshot first = TorrentPieces.sample(i -> true, last + 1, 0, 0, last, 0, size, piece, seek, false);
+            long consumed = first.readableEnd(seek);
+            equal(consumed, first.readableEnd(consumed));
+            int hole = (int) (consumed / piece) + 3;
+            TorrentPieces.Snapshot next = TorrentPieces.sample(i -> i != hole, last + 1, first.nextPiece,
+                0, last, 0, size, piece, consumed, false);
+            equal((long) hole * piece, next.readableEnd(consumed));
+        });
         test("native finished status can publish a large verified prefix without scanning it", () -> {
             long size = 90L * 1024 * 1024 * 1024, piece = 16 * 1024;
             int last = (int) ((size - 1) / piece);

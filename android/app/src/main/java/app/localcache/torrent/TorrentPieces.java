@@ -5,7 +5,7 @@ import java.util.function.IntPredicate;
 /** Bounded worker-side JNI reads; no per-torrent Java boolean/priority arrays. */
 public final class TorrentPieces {
     public static final int PREFIX_SCAN_LIMIT = 4096;
-    public static final int LOOKAHEAD = 256;
+    public static final int LOOKAHEAD = 1024;
 
     private TorrentPieces() {}
 

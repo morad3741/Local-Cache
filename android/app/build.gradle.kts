@@ -5,6 +5,17 @@ plugins {
 
 val libtorrent4jVersion = "2.1.0-39"
 val torrentNativeTests = providers.gradleProperty("torrentNativeTests").orNull == "true"
+val torrentHostJni = configurations.create("torrentHostJni") {
+    isCanBeConsumed = false
+    isTransitive = false
+}
+val extractTorrentNative = tasks.register<org.gradle.api.tasks.Sync>("extractTorrentNative") {
+    from({ torrentHostJni.map { zipTree(it) } })
+    include("**/libtorrent4j.so")
+    eachFile { relativePath = org.gradle.api.file.RelativePath(true, name) }
+    includeEmptyDirs = false
+    into(layout.buildDirectory.dir("torrent-native"))
+}
 
 android {
     namespace = "app.localcache"
@@ -38,6 +49,16 @@ android {
     testOptions {
         unitTests.isReturnDefaultValues = true
         unitTests.all {
+            if (torrentNativeTests) {
+                it.dependsOn(extractTorrentNative)
+                // libtorrent4j calls System.loadLibrary; a native jar on classpath alone
+                // does not extract/load the host binary.
+                it.systemProperty("libtorrent4j.jni.path", layout.buildDirectory.file("torrent-native/libtorrent4j.so").get().asFile.absolutePath)
+            }
+            it.testLogging {
+                events("passed", "skipped", "failed")
+                exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+            }
             it.useJUnit {
                 if (!torrentNativeTests) excludeCategories("app.localcache.torrent.NativeIntegration")
             }
@@ -127,7 +148,7 @@ dependencies {
     androidTestImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     if (torrentNativeTests) {
         // Host JNI tests are opt-in and never packaged into the Android APK.
-        testRuntimeOnly("org.libtorrent4j:libtorrent4j-linux:$libtorrent4jVersion")
+        add(torrentHostJni.name, "org.libtorrent4j:libtorrent4j-linux:$libtorrent4jVersion")
     }
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")

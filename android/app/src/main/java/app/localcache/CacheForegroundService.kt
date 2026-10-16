@@ -32,6 +32,7 @@ import kotlinx.coroutines.launch
 class CacheForegroundService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wakeLockAcquiredAtMs = 0L
     private val scope = CoroutineScope(Dispatchers.Main)
     private var notifyJob: Job? = null
 
@@ -85,6 +86,7 @@ class CacheForegroundService : Service() {
         notifyJob = scope.launch {
             val manager = getSystemService(NotificationManager::class.java)
             while (true) {
+                if (DownloadEngine.isBusy()) acquireWakeLock()
                 val port = ServerManager.activePort() ?: Prefs.serverPort(this@CacheForegroundService)
                 val text = "${DownloadEngine.statusLine()} · port $port"
                 runCatching { manager.notify(NOTIFICATION_ID, buildNotification(text)) }
@@ -103,12 +105,15 @@ class CacheForegroundService : Service() {
             .build()
 
     private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val pm = getSystemService(PowerManager::class.java) ?: return
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LocalCache::download").apply {
-            setReferenceCounted(false)
-            runCatching { acquire(WAKE_LOCK_TIMEOUT_MS) }
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (wakeLock?.isHeld == true && now - wakeLockAcquiredAtMs < WAKE_LOCK_RENEW_MS) return
+        val held = wakeLock ?: run {
+            val pm = getSystemService(PowerManager::class.java) ?: return
+            pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LocalCache::download").apply {
+                setReferenceCounted(false)
+            }.also { wakeLock = it }
         }
+        runCatching { held.acquire(WAKE_LOCK_TIMEOUT_MS); wakeLockAcquiredAtMs = now }
     }
 
     override fun onDestroy() {
@@ -130,6 +135,7 @@ class CacheForegroundService : Service() {
         private val CHANNEL_ID: String get() = BuildConfig.PREFS_FILE
         private const val NOTIFICATION_ID = 1
         private const val WAKE_LOCK_TIMEOUT_MS = 8L * 60 * 60 * 1000
+        private const val WAKE_LOCK_RENEW_MS = 60L * 60 * 1000
 
         fun start(context: Context) {
             val intent = Intent(context, CacheForegroundService::class.java)

@@ -23,7 +23,7 @@ data class CacheEntry(
     @Volatile var totalBytes: Long = 0,
     @Volatile var filePath: String? = null,
     @Volatile var lastError: String? = null,
-    var lastAccessMs: Long = 0,
+    @Volatile var lastAccessMs: Long = 0,
     /** Measured download throughput, so we can tell a slow link from a slow drive. */
     @Volatile var bytesPerSec: Long = 0,
     /**

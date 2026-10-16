@@ -74,7 +74,7 @@ object TorrentEngine {
     private const val UPLOAD_LIMIT_BYTES_PER_SEC = 1024 * 1024
 
     /** Pieces to mark TOP when playback seeks past what has been downloaded. */
-    private const val SEEK_PIECE_WINDOW = 8
+    private const val SEEK_WINDOW_BYTES = 16L * 1024 * 1024
 
     /** Opening window we keep at TOP_PRIORITY. One JNI array, not 24 deadline calls. */
     private const val HEAD_PIECES = 8
@@ -747,7 +747,11 @@ object TorrentEngine {
         if (offset < 0 || offset >= current.fileSize) return -1
         if (current.checking) return offset
 
-        return current.snapshot?.readableEnd(offset) ?: offset
+        val snapshot = current.snapshot
+        // Advance the worker's bounded seek window as a response consumes it. The
+        // initial HTTP Range offset alone would strand a long seeked response.
+        if (snapshot == null || offset >= snapshot.contiguousBytes) current.playhead = offset
+        return snapshot?.readableEnd(offset) ?: offset
     }
 
     /**
@@ -803,7 +807,9 @@ object TorrentEngine {
             add(current.lastPiece)
             for (i in current.cursor..minOf(current.lastPiece, current.cursor + HEAD_PIECES - 1)) add(i)
             if (seek > current.cursor + 4) {
-                for (i in seek..minOf(current.lastPiece, seek + SEEK_PIECE_WINDOW - 1)) add(i)
+                val window = ((SEEK_WINDOW_BYTES + current.pieceLength - 1) / current.pieceLength)
+                    .toInt().coerceIn(8, TorrentPieces.LOOKAHEAD)
+                for (i in seek..minOf(current.lastPiece, seek + window - 1)) add(i)
             }
         }
         val changes = int_byte_pair_vector()

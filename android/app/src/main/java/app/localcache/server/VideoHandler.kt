@@ -356,6 +356,7 @@ object VideoHandler {
                     raf.seek(position)
                     val read = raf.read(chunk, 0, want)
                     if (read > 0) {
+                        CacheRegistry.markAccessed(entry.cacheKey)
                         chunkStart = position
                         chunkLength = read
                         return true
@@ -445,6 +446,7 @@ object VideoHandler {
             if (onDisk) {
                 val n = readLocalWaiting(buffer, offset, want)
                 if (n > 0) {
+                    CacheRegistry.markAccessed(entry.cacheKey)
                     position += n
                     remaining -= n
                     return n

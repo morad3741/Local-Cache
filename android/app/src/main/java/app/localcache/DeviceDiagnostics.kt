@@ -37,7 +37,7 @@ object DeviceDiagnostics {
             "heapUsed=${runtime.totalMemory() - runtime.freeMemory()} heapMax=${runtime.maxMemory()} " +
             "nativeHeap=${Debug.getNativeHeapAllocatedSize()} network=$transport " +
             "validated=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)} " +
-            "metered=${cm?.isActiveNetworkMetered} mtu=${links?.mtu} " +
+            "metered=${cm?.isActiveNetworkMetered} mtu=${if (Build.VERSION.SDK_INT >= 29) links?.mtu else null} " +
             "dns=${links?.dnsServers?.joinToString(",") { it.hostAddress.orEmpty() }}"
     }.getOrElse { "deviceSnapshotError=${it.javaClass.simpleName}" }
 
