@@ -4,6 +4,7 @@ plugins {
 }
 
 val libtorrent4jVersion = "2.1.0-39"
+val torrentNativeTests = providers.gradleProperty("torrentNativeTests").orNull == "true"
 
 android {
     namespace = "app.localcache"
@@ -16,6 +17,7 @@ android {
         targetSdk = 34
         versionCode = 80
         versionName = "0.5.8"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("boolean", "WUPLAY_MODE", "false")
         buildConfigField("String", "PREFS_FILE", "\"local_cache_release\"")
         buildConfigField("int", "DEFAULT_PORT", "7100")
@@ -31,6 +33,15 @@ android {
 
     buildFeatures {
         buildConfig = true
+    }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+        unitTests.all {
+            it.useJUnit {
+                if (!torrentNativeTests) excludeCategories("app.localcache.torrent.NativeIntegration")
+            }
+        }
     }
 
     flavorDimensions += "audience"
@@ -100,7 +111,24 @@ android {
     }
 }
 
+configurations.configureEach {
+    if (torrentNativeTests && name.endsWith("UnitTestRuntimeClasspath")) {
+        // Android's Bionic .so files must not shadow the Linux host JNI library.
+        exclude(group = "org.libtorrent4j", module = "libtorrent4j-android-arm64")
+        exclude(group = "org.libtorrent4j", module = "libtorrent4j-android-arm")
+        exclude(group = "org.libtorrent4j", module = "libtorrent4j-android-x86_64")
+    }
+}
+
 dependencies {
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    if (torrentNativeTests) {
+        // Host JNI tests are opt-in and never packaged into the Android APK.
+        testRuntimeOnly("org.libtorrent4j:libtorrent4j-linux:$libtorrent4jVersion")
+    }
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("org.nanohttpd:nanohttpd:2.3.1")

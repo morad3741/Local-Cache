@@ -42,6 +42,7 @@ object DownloadEngine {
     private val lock = Any()
     private var activeJob: Job? = null
     private var activeRun: Run? = null
+    private val pendingRuns = mutableSetOf<Run>()
 
     @Volatile
     private var activeKeyValue: String? = null
@@ -65,12 +66,16 @@ object DownloadEngine {
     private data class Target(val final: File, val part: File)
 
     /** One download attempt, so a cancelled run can tell itself apart from a failure. */
-    private class Run(val cacheKey: String) {
+    private class Run(val cacheKey: String, val target: Target) {
         @Volatile
         var cancelled = false
 
         @Volatile
         var call: Call? = null
+
+        // Inspected under lock after the worker has closed its connection/native storage.
+        var deletePartial = false
+        var deleteFinal = false
 
         fun stop() {
             cancelled = true
@@ -83,37 +88,33 @@ object DownloadEngine {
         val entry = CacheRegistry.get(cacheKey) ?: return
         val target = resolveTarget(context, entry) ?: return
 
-        if (target.final.exists()) {
-            entry.status = "complete"
-            entry.downloadedBytes = target.final.length()
-            entry.totalBytes = target.final.length()
-            entry.lastError = null
-            return
-        }
-
-        if (target.part.exists() && !entry.isTorrent) {
-            entry.downloadedBytes = target.part.length()
-        }
-
         val ctx = context.applicationContext
-
-        if (entry.isTorrent && !Prefs.allowTorrents(ctx)) {
-            entry.status = "error"
-            entry.lastError = "Torrents are turned off in /settings"
-            Log.w(TAG, "refusing magnet ${entry.cacheKey} — torrents disabled")
-            DiagLog.w("refusing magnet ${entry.cacheKey} — torrents disabled")
-            return
-        }
 
         synchronized(lock) {
             if (!fromQueue) resumeQueue.clear()
 
-            if (activeKeyValue == cacheKey && activeJob?.isActive == true) return
+            // A previously completed file needs no worker and must not interrupt an
+            // unrelated transfer. Pending attempts still go through the join below.
+            if (target.final.exists() && pendingRuns.none { it.cacheKey == cacheKey }) {
+                CacheRegistry.refreshFromDisk(cacheKey)
+                return
+            }
+
+            if (entry.isTorrent && !Prefs.allowTorrents(ctx)) {
+                entry.status = "error"
+                entry.lastError = "Torrents are turned off in /settings"
+                Log.w(TAG, "refusing magnet ${entry.cacheKey} — torrents disabled")
+                DiagLog.w("refusing magnet ${entry.cacheKey} — torrents disabled")
+                return
+            }
+
+            if (activeKeyValue == cacheKey && activeRun?.cancelled == false && activeJob?.isActive == true) return
 
             // Newest request has priority — park whatever was running.
             val previous = stopActiveLocked("paused — another movie was started", deletePartial = false)
 
-            val run = Run(cacheKey)
+            val run = Run(cacheKey, target)
+            pendingRuns.add(run)
             activeRun = run
             activeKeyValue = cacheKey
             entry.status = "downloading"
@@ -131,6 +132,27 @@ object DownloadEngine {
                     previous?.join()
 
                     if (run.cancelled) return@launch
+                    TorrentEngine.storageReleaseError()?.let {
+                        entry.status = "error"
+                        entry.lastError = it
+                        return@launch
+                    }
+                    entry.filePath = target.final.absolutePath
+                    entry.status = "downloading"
+                    entry.lastError = null
+                    entry.downloadedBytes = if (!entry.isTorrent && target.part.exists()) target.part.length() else 0L
+                    entry.verifiedBytes = 0
+                    if (target.final.exists()) {
+                        if (entry.isTorrent && target.part.exists()) {
+                            entry.status = "error"
+                            entry.lastError = "Both finished and partial torrent cache files exist; keeping both"
+                            return@launch
+                        }
+                        entry.status = "complete"
+                        entry.downloadedBytes = target.final.length()
+                        entry.totalBytes = target.final.length()
+                        return@launch
+                    }
 
                     if (entry.isTorrent) {
                         downloadTorrent(ctx, entry, target, run)
@@ -153,6 +175,22 @@ object DownloadEngine {
                     download(entry, target, budget, run)
                 } finally {
                     val finishedOk = synchronized(lock) {
+                        // The job includes this cleanup. A replacement joins it before
+                        // touching the same files, including rapid A -> B -> A switches.
+                        if (run.deletePartial) {
+                            val releaseError = TorrentEngine.storageReleaseError()
+                            if (releaseError == null) {
+                                run.target.part.delete()
+                                if (run.deleteFinal) run.target.final.delete()
+                                if (run.deleteFinal || !run.target.final.exists()) LocalLibrary.deleteMeta(run.target.final)
+                                entry.downloadedBytes = 0
+                                entry.verifiedBytes = 0
+                            } else {
+                                entry.status = "error"
+                                entry.lastError = releaseError
+                            }
+                        }
+                        pendingRuns.remove(run)
                         if (activeRun === run) {
                             activeRun = null
                             activeJob = null
@@ -181,7 +219,7 @@ object DownloadEngine {
         if (entry.url.isBlank()) return
 
         val startNow = synchronized(lock) {
-            if (activeKeyValue == null) {
+            if (activeKeyValue == null || activeRun?.cancelled == true) {
                 true
             } else if (activeKeyValue == cacheKey) {
                 false
@@ -292,42 +330,53 @@ object DownloadEngine {
         if (keys.isEmpty()) return "No files selected."
 
         var deleted = 0
-        val stoppedActive = synchronized(lock) {
+        var deferred = 0
+        var blocked = 0
+        synchronized(lock) {
             resumeQueue.removeAll(keys.toSet())
-            val active = activeKeyValue
-            if (active != null && active in keys) {
-                stopActiveLocked("deleted from /settings", deletePartial = true)
-                active
-            } else {
-                null
-            }
-        }
-
-        keys.forEach { key ->
-            val entry = CacheRegistry.get(key)
-            val path = entry?.filePath
-                ?: CachePaths.finalFile(context, key, entry?.url.orEmpty())?.absolutePath
-            if (path != null) {
-                val final = File(path)
-                val part = CachePaths.partFile(final)
-                if (key == stoppedActive) {
-                    // stopActiveLocked already removed the .part when deletePartial=true
-                    if (final.exists() && final.delete()) deleted++
-                    LocalLibrary.deleteMeta(final)
-                } else {
+            keys.forEach { key ->
+                val entry = CacheRegistry.get(key)
+                val path = entry?.filePath
+                    ?: CachePaths.finalFile(context, key, entry?.url.orEmpty())?.absolutePath
+                if (path != null && pendingRuns.any { it.cacheKey != key && it.target.final.absolutePath == path }) {
+                    entry?.lastError = "Cache path is in use by another download; file kept"
+                    blocked++
+                    return@forEach
+                }
+                val pending = pendingRuns.filter { it.cacheKey == key }
+                if (pending.isNotEmpty()) {
+                    pending.forEach { run ->
+                        run.deletePartial = true
+                        run.deleteFinal = true
+                        run.stop()
+                    }
+                    TorrentEngine.abort(key)
+                    entry?.status = "cancelled"
+                    entry?.lastError = "deleting after storage closes…"
+                    deferred++
+                    return@forEach
+                }
+                if (TorrentEngine.storageReleaseError() != null) {
+                    blocked++
+                    return@forEach
+                }
+                if (path != null) {
+                    val final = File(path)
+                    val part = CachePaths.partFile(final)
                     if (part.exists() && part.delete()) deleted++
                     if (final.exists() && final.delete()) deleted++
                     LocalLibrary.deleteMeta(final)
                 }
+                CacheRegistry.markEvicted(key)
+                entry?.status = "cancelled"
+                entry?.lastError = "deleted from /settings"
+                entry?.downloadedBytes = 0
+                entry?.bytesPerSec = 0
             }
-            CacheRegistry.markEvicted(key)
-            entry?.status = "cancelled"
-            entry?.lastError = "deleted from /settings"
-            entry?.downloadedBytes = 0
-            entry?.bytesPerSec = 0
         }
 
-        return "Removed $deleted file(s) from storage."
+        return "Removed $deleted file(s); $deferred waiting for storage to close." +
+            if (blocked > 0) " Kept $blocked download(s): cache path is still in use or torrent storage did not close." else ""
     }
 
     /** @deprecated Prefer [deleteSelected] — kept name used by older settings labels. */
@@ -349,9 +398,9 @@ object DownloadEngine {
         val job = activeJob
 
         run.stop()
-        // A torrent does not notice the flag until its next poll, and the caller may be about
-        // to delete the file underneath it.
+        // Abort only invalidates playback snapshots. Native teardown stays on the worker.
         TorrentEngine.abort(run.cacheKey)
+        run.deletePartial = run.deletePartial || deletePartial
 
         CacheRegistry.get(run.cacheKey)?.let { entry ->
             if (entry.status == "downloading" || entry.status == "queued") {
@@ -361,20 +410,12 @@ object DownloadEngine {
             entry.bytesPerSec = 0
 
             if (deletePartial) {
-                entry.filePath?.let { path ->
-                    val part = CachePaths.partFile(File(path))
-                    if (part.exists() && part.delete()) {
-                        Log.i(TAG, "discarded partial ${part.name}")
-                    }
-                }
-                entry.downloadedBytes = 0
                 entry.status = "cancelled"
             }
         }
 
-        activeRun = null
-        activeJob = null
-        activeKeyValue = null
+        // Keep the tail job even after cancellation so a replacement also waits for
+        // pending predecessors and deletion, rather than starting beside an old writer.
         Log.i(TAG, "stopped ${run.cacheKey}: $reason")
         return job
     }
@@ -388,7 +429,7 @@ object DownloadEngine {
             if (activeKeyValue == null) return "Nothing is downloading"
             stopActiveLocked("cancelled from the app", deletePartial)
             return if (deletePartial) {
-                "Cancelled download and freed its partial file"
+                "Cancelling — partial file will be removed after storage closes"
             } else {
                 "Paused download — partial file kept"
             }
@@ -398,6 +439,27 @@ object DownloadEngine {
     fun isBusy(): Boolean = synchronized(lock) { activeKeyValue != null }
 
     fun activeKey(): String? = activeKeyValue
+
+    /** Quota cleanup must also protect cancelled workers that are still closing files. */
+    fun pendingPaths(): Set<String> = synchronized(lock) {
+        pendingRuns.flatMap {
+            listOf(it.target.final.absolutePath, it.target.part.absolutePath, LocalLibrary.metaFile(it.target.final).absolutePath)
+        }.toSet()
+    }
+
+    /** Keep the ownership check, deletion and registry update atomic against new starts. */
+    fun deleteIdleFile(file: File, onDeleted: () -> Unit): Boolean = synchronized(lock) {
+        if (TorrentEngine.storageReleaseError() != null || file.absolutePath in pendingPaths()) return false
+        // libtorrent's partfile contains skipped boundary data. It is not the video's
+        // .part, and must also survive quota/wipe while a torrent still owns storage.
+        if (pendingRuns.any {
+                CacheRegistry.get(it.cacheKey)?.isTorrent == true &&
+                    (file.name.endsWith(".parts") || file.name.startsWith(".${it.target.part.name}.unselected-"))
+            }) return false
+        if (!file.delete()) return false
+        onDeleted()
+        true
+    }
 
     /**
      * Frees space for this movie and returns the maximum bytes it may occupy,
@@ -602,7 +664,7 @@ object DownloadEngine {
         }
 
         entry.status = "error"
-        entry.lastError = result.error ?: entry.lastError ?: "Torrent download failed"
+        entry.lastError = TorrentEngine.storageReleaseError() ?: result.error ?: entry.lastError ?: "Torrent download failed"
         Log.e(TAG, "torrent failed ${entry.cacheKey}: ${entry.lastError}")
         DiagLog.e("torrent failed ${entry.cacheKey}: ${entry.lastError}")
     }

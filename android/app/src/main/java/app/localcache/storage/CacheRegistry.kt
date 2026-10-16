@@ -11,21 +11,21 @@ data class CacheEntry(
     val type: String?,
     val id: String?,
     val source: String?,
-    var status: String = "registered",
+    @Volatile var status: String = "registered",
     /**
      * Bytes that can be read from byte 0 onwards. For HTTP that is simply the size of the
      * `.part`; for a torrent the file is sparse and full-length from the start, so only the
      * engine knows how much is really there.
      */
-    var downloadedBytes: Long = 0,
+    @Volatile var downloadedBytes: Long = 0,
     /** Pieces hashed so far. For torrents this is often ahead of [downloadedBytes]. */
-    var verifiedBytes: Long = 0,
-    var totalBytes: Long = 0,
-    var filePath: String? = null,
-    var lastError: String? = null,
+    @Volatile var verifiedBytes: Long = 0,
+    @Volatile var totalBytes: Long = 0,
+    @Volatile var filePath: String? = null,
+    @Volatile var lastError: String? = null,
     var lastAccessMs: Long = 0,
     /** Measured download throughput, so we can tell a slow link from a slow drive. */
-    var bytesPerSec: Long = 0,
+    @Volatile var bytesPerSec: Long = 0,
     /**
      * True when this file was queued by auto-next (not opened in Stremio).
      * Completing an auto-prefetched episode must not chain into the whole season.
@@ -83,6 +83,7 @@ object CacheRegistry {
         }
         if (item.totalBytes > entry.totalBytes) entry.totalBytes = item.totalBytes
         if (item.complete) entry.status = "complete"
+        if (entry.isTorrent) refreshFromDisk(entry.cacheKey)
     }
 
     fun get(cacheKey: String): CacheEntry? = entries[cacheKey]
@@ -133,6 +134,12 @@ object CacheRegistry {
         val final = java.io.File(fp)
         val part = java.io.File("$fp.part")
         when {
+            entry.isTorrent && final.exists() && part.exists() -> {
+                entry.status = "error"
+                entry.lastError = "Both finished and partial torrent cache files exist; keeping both"
+                entry.downloadedBytes = 0
+                entry.verifiedBytes = 0
+            }
             final.exists() -> {
                 entry.status = "complete"
                 entry.downloadedBytes = final.length()

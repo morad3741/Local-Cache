@@ -13,11 +13,27 @@ import org.libtorrent4j.Sha1Hash
 import org.libtorrent4j.TorrentFlags
 import org.libtorrent4j.TorrentHandle
 import org.libtorrent4j.TorrentInfo
+import org.libtorrent4j.TorrentStatus
 import org.libtorrent4j.alerts.Alert
 import org.libtorrent4j.alerts.AlertType
+import org.libtorrent4j.alerts.FileErrorAlert
+import org.libtorrent4j.alerts.TorrentErrorAlert
+import org.libtorrent4j.alerts.TorrentPausedAlert
+import org.libtorrent4j.alerts.TorrentRemovedAlert
+import org.libtorrent4j.swig.add_torrent_params
+import org.libtorrent4j.swig.byte_vector
+import org.libtorrent4j.swig.error_code
+import org.libtorrent4j.swig.int_string_map
+import org.libtorrent4j.swig.libtorrent
+import org.libtorrent4j.swig.peer_info_vector
 import org.libtorrent4j.swig.settings_pack
 import org.libtorrent4j.swig.status_flags_t
+import org.libtorrent4j.swig.torrent_info
+import org.libtorrent4j.swig.tcp_endpoint_vector
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.UUID
 
 /**
  * BitTorrent side of the cache, used when a stream is a magnet instead of a debrid HTTP link.
@@ -42,6 +58,9 @@ object TorrentEngine {
     /** Stop waiting when a live torrent stops making progress entirely. */
     private const val STALL_TIMEOUT_MS = 10 * 60_000L
 
+    private const val CHECKING_STALL_TIMEOUT_MS = 10 * 60_000L
+    private const val DISK_RELEASE_TIMEOUT_MS = 60_000L
+
     private const val POLL_MS = 1_000L
 
     /** Upload cap so seeding never competes with the movie the user is watching. */
@@ -62,8 +81,7 @@ object TorrentEngine {
 
     /**
      * How far ahead of the playhead to look for readable pieces. Playback only ever reads a
-     * couple of MB at a time, so there is no point walking a whole finished torrent — and each
-     * check is a JNI call.
+     * couple of MB at a time, so scanning a bounded window of the snapshot is sufficient.
      */
     private const val LOOKAHEAD_PIECES = 256
 
@@ -84,6 +102,12 @@ object TorrentEngine {
     /** What the engine is doing right now, for the notification and /settings. */
     @Volatile
     private var phase: String? = null
+
+    @Volatile
+    private var storageError: String? = null
+
+    /** A failed native shutdown must never permit deletion or another writer. */
+    fun storageReleaseError(): String? = storageError
 
     @Volatile
     private var listenerAttached = false
@@ -112,9 +136,32 @@ object TorrentEngine {
         @Volatile var cursor: Int,
         @Volatile var playhead: Long = 0L,
         @Volatile var haveBits: BooleanArray? = null,
+        @Volatile var checking: Boolean = true,
         @Volatile var lastPrioCursor: Int = Int.MIN_VALUE,
         @Volatile var lastPrioSeek: Int = Int.MIN_VALUE,
     )
+
+    /** Copy callback data while alerts are valid; correctness never depends on diagnostics. */
+    private class TransferEvents : AlertListener {
+        val paused = ConcurrentHashMap.newKeySet<Long>()
+        val removed = CopyOnWriteArrayList<TorrentHandle>()
+        val errors = ConcurrentHashMap<Long, String>()
+
+        override fun types(): IntArray = intArrayOf(
+            AlertType.TORRENT_PAUSED.swig(), AlertType.TORRENT_REMOVED.swig(),
+            AlertType.FILE_ERROR.swig(), AlertType.TORRENT_ERROR.swig(),
+        )
+
+        override fun alert(alert: Alert<*>) {
+            when (alert) {
+                is TorrentPausedAlert -> paused.add(alert.handle().swig().id())
+                is TorrentRemovedAlert -> removed.add(alert.handle())
+                is FileErrorAlert -> errors[alert.handle().swig().id()] =
+                    "Storage ${alert.operation()}: ${alert.error().message}"
+                is TorrentErrorAlert -> errors[alert.handle().swig().id()] = alert.error().message
+            }
+        }
+    }
 
     data class Result(val ok: Boolean, val error: String? = null)
 
@@ -184,35 +231,35 @@ object TorrentEngine {
                 runCatching { manager.removeListener(alertListener) }
                 listenerAttached = false
             }
-            runCatching { manager?.stop() }
-            session = null
+            val stopped = runCatching { manager?.stop() }.isSuccess
+            if (stopped) {
+                storageError = null
+                session = null
+            } else {
+                storageError = "Could not close torrent storage; restart Local Cache"
+            }
         }
     }
 
     /**
-     * Drops [cacheKey] out of the session right now. The download loop only checks its cancel
-     * flag once a second, which is too slow when the caller is about to delete the file.
+     * Stops exposing pieces immediately. The worker pauses, waits for disk IO, then removes
+     * the handle; its owner must join that worker before deleting or reusing its paths.
      */
     fun abort(cacheKey: String) {
         val current = active ?: return
         if (current.cacheKey != cacheKey) return
-        active = null
-        runCatching { current.handle.pause() }
-        runCatching { session?.remove(current.handle) }
+        current.haveBits = null
+        current.checking = true
+        phase = "stopping torrent and closing storage…"
         Log.i(TAG, "aborted $cacheKey")
     }
 
-    /**
-     * Live line for the notification and /settings. Includes libtorrent's own state name: a
-     * torrent that reads "downloading, 40 peers" but never moves is a very different problem
-     * from one stuck in "downloading_metadata" with none.
-     */
+    /** Latest worker phase/peer counts, safe to read from the notification and /settings. */
     fun statusDetail(): String? {
-        val current = active ?: return phase
-        val status = runCatching { current.handle.status() }.getOrNull() ?: return phase
-        val state = status.state().name.lowercase().replace('_', ' ')
-        return "$state · ${status.numPeers()} peers · ${status.numSeeds()} seeds"
+        return phase
     }
+
+    fun isChecking(cacheKey: String): Boolean = active?.let { it.cacheKey == cacheKey && it.checking } == true
 
     /**
      * Downloads one file out of [entry]'s magnet into [partFile], then renames it to [finalFile].
@@ -227,6 +274,7 @@ object TorrentEngine {
         cancelled: () -> Boolean,
         onMetadata: (totalBytes: Long) -> Boolean,
     ): Result {
+        storageError?.let { return Result(false, it) }
         val manager = ensureSession()
             ?: return Result(false, "Torrent engine unavailable: ${loadError ?: "native library not loaded"}")
 
@@ -243,13 +291,23 @@ object TorrentEngine {
             ?: return Result(false, "Magnet info hash could not be parsed")
 
         var handle: TorrentHandle? = null
+        val metadataDir = File(saveDir, ".torrent-metadata-${UUID.randomUUID()}")
+        var metadataDirCreated = false
+        val events = TransferEvents()
+        manager.addListener(events)
 
         try {
-            // A torrent is added exactly once. Adding it twice is not an error libtorrent
-            // reports — the second add silently returns the first handle, and if that one was
-            // still winding down from a previous attempt it sits at 0% forever.
-            dropFromSession(manager, sha1)
+            // An old writer must be quiescent before this attempt can reuse its paths.
+            manager.find(sha1)?.let { leftover ->
+                if (!pauseAndRemove(manager, leftover, events)) return Result(false, storageError)
+            }
             if (cancelled()) return Result(false, null)
+
+            TorrentFiles.validate(partFile, finalFile)
+            entry.downloadedBytes = 0
+            entry.verifiedBytes = 0
+            check(metadataDir.mkdir()) { "Cannot create torrent metadata folder" }
+            metadataDirCreated = true
 
             report(entry, "finding peers for the torrent…")
             Log.i(TAG, "adding $infoHash for ${entry.cacheKey} -> ${saveDir.absolutePath}")
@@ -258,35 +316,35 @@ object TorrentEngine {
                     "part=${partFile.name} magnet=${magnet.take(220)}",
             )
 
-            // Proven locally: DEFAULT_DONT_DOWNLOAD combined with renameFile leaves the
-            // torrent wanting data but never connecting. Sequential + an immediate resume
-            // is the path that actually fetched pieces. Extra files are ignored after
-            // metadata, once we know which one we want.
-            manager.download(magnet, saveDir, TorrentFlags.SEQUENTIAL_DOWNLOAD)
-
-            val added = awaitHandle(manager, sha1)
-                ?: return Result(false, "Torrent could not be added to the session")
-            handle = added
-
-            // parse_magnet_uri starts torrents paused+auto_managed. If we drop auto-manage
-            // and do not resume, metadata never arrives and progress sits at 0% forever.
-            runCatching { added.unsetFlags(TorrentFlags.AUTO_MANAGED) }
-            runCatching { added.unsetFlags(TorrentFlags.PAUSED.or_(TorrentFlags.UPLOAD_MODE)) }
-            runCatching { added.resume() }
-            DiagLog.t("resumed after add ${snapshot(added)}")
-
-            val torrentInfo = awaitMetadata(added, entry, cancelled)
+            // Set the gate in add_torrent_params, before adding. AUTO_MANAGED could
+            // otherwise clear UPLOAD_MODE while storage approval is still pending.
+            val metadataHandle = addTorrent(manager, parameters(magnet, metadataDir))
+            handle = metadataHandle
+            val metadata = awaitMetadata(metadataHandle, entry, cancelled, events)
             if (cancelled()) return Result(false, null)
-            if (torrentInfo == null) {
-                val peers = runCatching { added.status().numPeers() }.getOrDefault(0)
+            if (metadata == null) {
+                val peers = metadataHandle.status().numPeers()
                 return Result(false, "No peers sent the torrent details ($peers peers reached)")
             }
+
+            // Own a copy before removing the metadata handle. The payload add below is
+            // a fresh torrent with its final storage mapping and initial priorities.
+            val torrentInfo = TorrentInfo(torrent_info(metadata.swig()))
+            // Reuse the peers that supplied metadata. A second tracker announce can be
+            // rate limited, and waiting for DHT again is especially costly on a TV.
+            val peerInfo = peer_info_vector()
+            metadataHandle.swig().get_peer_info(peerInfo)
+            val knownPeers = tcp_endpoint_vector()
+            for (i in 0 until peerInfo.size().toInt()) knownPeers.add(peerInfo[i].remote_endpoint())
+            if (!pauseAndRemove(manager, metadataHandle, events)) return Result(false, storageError)
+            handle = null
 
             val files = torrentInfo.files()
             val fileIndex = pickVideoFile(torrentInfo, entry.fileIndex)
             if (fileIndex < 0) return Result(false, "Torrent has no video file")
 
             val fileSize = files.fileSize(fileIndex)
+            check(fileSize > 0) { "Selected torrent file is empty" }
             entry.totalBytes = fileSize
             Log.i(
                 TAG,
@@ -297,43 +355,34 @@ object TorrentEngine {
                 "metadata name=${files.fileName(fileIndex)} size=$fileSize " +
                     "index=$fileIndex/${torrentInfo.numFiles()} " +
                     "pieceLen=${torrentInfo.pieceLength()} pieces=${torrentInfo.numPieces()} " +
-                    "offset=${files.fileOffset(fileIndex)} ${snapshot(added)}",
+                    "offset=${files.fileOffset(fileIndex)}",
             )
 
             if (!onMetadata(fileSize)) return Result(false, entry.lastError)
             if (cancelled()) return Result(false, null)
 
-            val resuming = partFile.exists() && partFile.length() > 0
-
-            // Stay in the swarm. Pausing here used to send a tracker "stopped", drop
-            // peers, and give rarest-first a head start on the middle of the file.
-            val priorities = Priority.array(Priority.IGNORE, torrentInfo.numFiles())
-            priorities[fileIndex] = Priority.TOP_PRIORITY
-            runCatching { added.prioritizeFiles(priorities) }
-                .onFailure { return Result(false, "Could not select the file: ${it.message}") }
-            if (added.filePriority(fileIndex) == Priority.IGNORE) {
-                runCatching { added.filePriority(fileIndex, Priority.TOP_PRIORITY) }
-            }
-
-            // torrentFile().filePath() does not update after renameFile. The write still
-            // goes to the new name — waiting for the path to change aborted working downloads.
-            runCatching { added.renameFile(fileIndex, partFile.name) }
-                .onFailure {
-                    Log.w(TAG, "renameFile failed: ${it.message}")
-                    DiagLog.w("renameFile failed: ${it.message}")
+            TorrentFiles.validate(partFile, finalFile)
+            val payload = parameters(magnet, saveDir)
+            val peers = payload.peers
+            for (i in 0 until knownPeers.size().toInt()) peers.add(knownPeers[i])
+            payload.peers = peers
+            payload.set_ti(torrentInfo.swig())
+            val names = int_string_map()
+            val priorities = byte_vector()
+            for (i in 0 until torrentInfo.numFiles()) {
+                // No path from torrent metadata can alias another cache entry.
+                val name = if (i == fileIndex) partFile.name else ".${partFile.name}.unselected-$i"
+                TorrentFiles.validateCacheFile(saveDir, File(saveDir, name))
+                if (i != fileIndex && File(saveDir, name).exists()) {
+                    return Result(false, "Unselected torrent cache path already exists: $name")
                 }
-            DiagLog.t(
-                "priorities file$fileIndex=${added.filePriority(fileIndex)} " +
-                    "partExists=${partFile.exists()} partLen=${partFile.length()}",
-            )
-
-            if (resuming) {
-                Log.i(TAG, "rechecking existing ${partFile.name} (${partFile.length()} bytes)")
-                report(entry, "checking the part already on disk…")
-                runCatching { added.forceRecheck() }
+                names[i] = name
+                priorities.add((if (i == fileIndex) Priority.TOP_PRIORITY else Priority.IGNORE).swig().toByte())
             }
-
-            runCatching { added.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD) }
+            payload.set_renamed_files(names)
+            payload.set_file_priorities(priorities)
+            val added = addTorrent(manager, payload)
+            handle = added
 
             val pieceLength = torrentInfo.pieceLength().toLong()
             if (pieceLength <= 0) return Result(false, "Torrent piece size was 0")
@@ -361,6 +410,11 @@ object TorrentEngine {
             active = current
             applyPlaybackPriorities(current)
 
+            if (cancelled()) return Result(false, null)
+            // No resume flags or guessed have-pieces: libtorrent checks the mapped files
+            // on this fresh add. Length (including sparse length) never grants trust.
+            added.unsetFlags(TorrentFlags.UPLOAD_MODE)
+
             DiagLog.t("pump start firstPiece=$firstPiece lastPiece=$lastPiece offset=$fileOffset")
             val result = pump(
                 entry,
@@ -371,21 +425,16 @@ object TorrentEngine {
                 fileSize,
                 pieceLength,
                 cancelled,
+                events,
             )
             if (!result.ok) return result
 
-            // libtorrent still owns the file handle until the torrent leaves the session.
+            if (cancelled()) return Result(false, null)
             active = null
-            runCatching { manager.remove(added) }
+            if (!pauseAndRemove(manager, added, events)) return Result(false, storageError)
             handle = null
-
-            val written = findWrittenFile(saveDir, partFile, torrentInfo, fileIndex)
-            if (written == null) {
-                return Result(false, "Torrent finished but the video file was not on disk")
-            }
-            if (!renameWhenReleased(written, finalFile)) {
-                return Result(false, "Could not rename the finished torrent file")
-            }
+            if (cancelled()) return Result(false, null)
+            TorrentFiles.finish(partFile, finalFile, fileSize)
 
             entry.status = "complete"
             entry.downloadedBytes = finalFile.length()
@@ -401,37 +450,91 @@ object TorrentEngine {
             return Result(false, e.message ?: e.javaClass.simpleName)
         } finally {
             active = null
-            phase = null
             entry.bytesPerSec = 0
             handle?.let { open ->
-                // Cancelled or failed: drop it from the session but keep the .part for resume.
-                runCatching { open.pause() }
-                runCatching { manager.remove(open) }
+                if (storageError == null) pauseAndRemove(manager, open, events)
             }
+            manager.removeListener(events)
+            if (metadataDirCreated && storageError == null) metadataDir.delete() // Only our empty directory; never recursive.
+            phase = null
         }
     }
 
-    /**
-     * Removes any torrent already in the session for [sha1] and waits for it to actually go.
-     * `remove_torrent` is asynchronous, and re-adding before it lands hands back the old
-     * handle instead of a fresh one.
-     */
-    private fun dropFromSession(manager: SessionManager, sha1: Sha1Hash) {
-        val existing = runCatching { manager.find(sha1) }.getOrNull() ?: return
-        Log.i(TAG, "removing leftover torrent ${sha1.toHex()} before re-adding")
-        DiagLog.t("removing leftover ${sha1.toHex()}")
-        runCatching { manager.remove(existing) }
+    private fun monotonicMs(): Long = System.nanoTime() / 1_000_000L
 
-        val deadline = System.currentTimeMillis() + 15_000
-        while (System.currentTimeMillis() < deadline) {
-            if (runCatching { manager.find(sha1) }.getOrNull() == null) return
+    private fun parameters(magnet: String, saveDir: File): add_torrent_params {
+        val error = error_code()
+        val params = libtorrent.parse_magnet_uri(magnet, error)
+        check(error.value() == 0) { "Invalid magnet: ${error.message()}" }
+        params.setSave_path(saveDir.absolutePath)
+        params.setFlags(
+            params.flags.and_(TorrentFlags.AUTO_MANAGED.inv()).and_(TorrentFlags.PAUSED.inv())
+                .or_(TorrentFlags.UPLOAD_MODE).or_(TorrentFlags.SEQUENTIAL_DOWNLOAD)
+                .or_(TorrentFlags.DUPLICATE_IS_ERROR),
+        )
+        return params
+    }
+
+    /** Blocking add runs only on the download worker; no unowned async add survives cancel. */
+    private fun addTorrent(manager: SessionManager, params: add_torrent_params): TorrentHandle {
+        val error = error_code()
+        val handle = TorrentHandle(manager.swig().add_torrent(params, error))
+        check(error.value() == 0 && handle.isValid) { "Could not add torrent: ${error.message()}" }
+        return handle
+    }
+
+    private fun pauseAndRemove(manager: SessionManager, handle: TorrentHandle, events: TransferEvents): Boolean {
+        return runCatching {
+            if (wasStopped(manager)) return true
+            phase = "closing torrent storage…"
+            val id = handle.swig().id()
+            handle.unsetFlags(TorrentFlags.AUTO_MANAGED)
+            handle.pause()
+            // torrent_paused_alert is the documented disk-closed barrier. Invalidating
+            // a handle or observing find()==null alone does not prove writes have stopped.
+            check(waitFor(DISK_RELEASE_TIMEOUT_MS) { wasStopped(manager) || id in events.paused }) {
+                "Torrent storage did not close within 60 s; restart Local Cache before retrying or deleting"
+            }
+            if (wasStopped(manager)) return true
+            manager.remove(handle)
+            // Removed handles are invalid but still compare equal as weak pointers.
+            check(waitFor(20_000L) { wasStopped(manager) || events.removed.any { it == handle } }) {
+                "Torrent did not leave the session; restart Local Cache before retrying or deleting"
+            }
+            true
+        }.getOrElse {
+            if (wasStopped(manager)) return true
+            storageError = it.message ?: "Could not close torrent storage; restart Local Cache"
+            Log.e(TAG, storageError.orEmpty())
+            false
+        }
+    }
+
+    private fun wasStopped(manager: SessionManager): Boolean {
+        if (manager.isRunning) return false
+        // shutdown holds this lock through native destruction. isRunning=false by
+        // itself is too early: SessionManager clears it before joining native threads.
+        return synchronized(lock) { session !== manager && storageError == null }
+    }
+
+    private fun waitFor(timeoutMs: Long, done: () -> Boolean): Boolean {
+        val deadline = monotonicMs() + timeoutMs
+        while (!done()) {
+            if (monotonicMs() >= deadline) return false
             try {
-                Thread.sleep(100)
+                Thread.sleep(50)
             } catch (_: InterruptedException) {
-                return
+                // Interruption is not proof that native disk IO has closed.
+                return false
             }
         }
-        Log.w(TAG, "leftover torrent ${sha1.toHex()} did not leave the session in time")
+        return true
+    }
+
+    private fun checkNativeError(handle: TorrentHandle, events: TransferEvents, status: TorrentStatus = handle.status()) {
+        events.errors[handle.swig().id()]?.let { throw IllegalStateException(it) }
+        val error = status.errorCode()
+        check(error == null || error.value == 0) { "Torrent storage/network error: ${error?.message}" }
     }
 
     /** Waits for the swarm to send the file list a magnet does not carry. */
@@ -439,11 +542,13 @@ object TorrentEngine {
         handle: TorrentHandle,
         entry: CacheEntry,
         cancelled: () -> Boolean,
+        events: TransferEvents,
     ): TorrentInfo? {
-        val deadline = System.currentTimeMillis() + METADATA_TIMEOUT_MS
+        val deadline = monotonicMs() + METADATA_TIMEOUT_MS
         var waitTick = 0
-        while (System.currentTimeMillis() < deadline) {
+        while (monotonicMs() < deadline) {
             if (cancelled() || !handle.isValid) return null
+            checkNativeError(handle, events)
 
             val status = runCatching { handle.status() }.getOrNull()
             if (status?.hasMetadata() == true) {
@@ -481,65 +586,58 @@ object TorrentEngine {
         fileSize: Long,
         pieceLength: Long,
         cancelled: () -> Boolean,
+        events: TransferEvents,
     ): Result {
         var cursor = firstPiece
-        var lastProgressAt = System.currentTimeMillis()
-        var lastContiguous = -1L
         var tick = 0
-        val startedAt = System.currentTimeMillis()
+        val budget = TorrentProgress(monotonicMs(), FIRST_BYTES_TIMEOUT_MS, STALL_TIMEOUT_MS, CHECKING_STALL_TIMEOUT_MS)
 
         while (true) {
             if (cancelled()) return Result(false, null)
             if (!handle.isValid) return Result(false, "Torrent was removed from the session")
-
-            val status = runCatching { handle.status(status_flags_t.all()) }.getOrNull()
-            val haveCopy = copyHaveBits(status?.pieces(), lastPiece)
+            val status = handle.status(status_flags_t.all())
+            checkNativeError(handle, events, status)
+            if (cancelled()) return Result(false, null)
+            val checking = status.state().name.contains("CHECKING")
+            // A recheck invalidates every previous piece snapshot, including after a seek.
+            if (checking) cursor = firstPiece
+            val haveCopy = if (checking) null else copyHaveBits(status.pieces(), lastPiece)
             if (haveCopy != null) {
                 while (cursor <= lastPiece && cursor < haveCopy.size && haveCopy[cursor]) cursor++
-            } else {
-                while (cursor <= lastPiece && runCatching { handle.havePiece(cursor) }.getOrDefault(false)) {
-                    cursor++
-                }
             }
             active?.let { current ->
                 if (current.handle === handle) {
                     current.cursor = cursor
-                    if (haveCopy != null) current.haveBits = haveCopy
-                    maybeApplyPriorities(current)
+                    current.checking = checking
+                    current.haveBits = haveCopy
+                    if (!checking) maybeApplyPriorities(current)
                 }
             }
             val readableEnd = minOf(cursor.toLong() * pieceLength, fileOffset + fileSize)
             val contiguous = (readableEnd - fileOffset).coerceIn(0, fileSize)
-            val verified = status?.totalWantedDone() ?: 0L
+            val verified = if (checking) 0L else status.totalWantedDone().coerceAtMost(fileSize)
 
             entry.downloadedBytes = contiguous
             entry.verifiedBytes = verified
-            entry.bytesPerSec = status?.downloadRate()?.toLong() ?: 0L
-
-            if (contiguous > lastContiguous) {
-                lastContiguous = contiguous
-                lastProgressAt = System.currentTimeMillis()
-            }
+            entry.bytesPerSec = if (checking) 0L else status.downloadPayloadRate().toLong()
 
             if (cursor > lastPiece) return Result(true)
-            if (status?.isFinished == true && contiguous >= fileSize) return Result(true)
-
-            val peers = status?.numPeers() ?: 0
-            val seeds = status?.numSeeds() ?: 0
-            val state = status?.state()?.name?.lowercase().orEmpty()
+            val peers = status.numPeers()
+            val seeds = status.numSeeds()
+            val state = status.state().name.lowercase()
             report(
                 entry,
                 when {
-                    state.contains("checking") -> "checking the part already on disk…"
-                    peers == 0 -> "searching for peers…"
+                    checking -> "checking storage · ${status.progressPpm() / 10_000}% checked"
+                    peers == 0 -> "searching for peers · $seeds seeds"
                     contiguous < 4L * 1024 * 1024 ->
                         "$peers peers · ${verified / (1024 * 1024)} MB in · opening the file"
-                    else -> null
+                    else -> "$peers peers · $seeds seeds · downloading"
                 },
             )
 
             tick++
-            val now = System.currentTimeMillis()
+            val now = monotonicMs()
             if (DiagLog.enabled && (tick <= 8 || tick % 3 == 0)) {
                 DiagLog.t(
                     "pump tick=$tick contig=$contiguous cursor=$cursor " +
@@ -548,16 +646,8 @@ object TorrentEngine {
                 )
             }
 
-            val idleMs = now - lastProgressAt
-            if (contiguous <= 0 && now - startedAt > FIRST_BYTES_TIMEOUT_MS) {
-                return Result(
-                    false,
-                    "Torrent sent no usable data in 5 min " +
-                        "($state, $peers peers, $seeds seeds, ${verified / (1024 * 1024)} MB verified)",
-                )
-            }
-            if (contiguous > 0 && idleMs > STALL_TIMEOUT_MS) {
-                return Result(false, "Torrent stalled at ${contiguous / (1024 * 1024)} MB ($peers peers)")
+            budget.sample(now, checking, status.progressPpm(), contiguous, verified)?.let {
+                return Result(false, "$it ($state, $peers peers, $seeds seeds)")
             }
 
             try {
@@ -581,27 +671,11 @@ object TorrentEngine {
         val current = active ?: return -1
         if (current.cacheKey != cacheKey) return -1
         if (offset < 0 || offset >= current.fileSize) return -1
+        if (current.checking) return offset
 
-        val first = ((current.fileOffset + offset) / current.pieceLength).toInt()
-        val have = current.haveBits
-        if (have != null) {
-            if (first < 0 || first >= have.size || !have[first]) return offset
-            var piece = first + 1
-            val stopAt = minOf(current.lastPiece, first + LOOKAHEAD_PIECES, have.size - 1)
-            while (piece <= stopAt && have[piece]) piece++
-            val end = piece.toLong() * current.pieceLength - current.fileOffset
-            return end.coerceIn(offset, current.fileSize)
-        }
-
-        val handle = current.handle
-        return runCatching {
-            if (!handle.havePiece(first)) return offset
-            var piece = first + 1
-            val stopAt = minOf(current.lastPiece, first + LOOKAHEAD_PIECES)
-            while (piece <= stopAt && handle.havePiece(piece)) piece++
-            val end = piece.toLong() * current.pieceLength - current.fileOffset
-            end.coerceIn(offset, current.fileSize)
-        }.getOrDefault(-1)
+        return TorrentProgress.readableEnd(
+            current.haveBits, current.fileOffset, current.fileSize, current.pieceLength, offset, LOOKAHEAD_PIECES,
+        )
     }
 
     /**
@@ -708,56 +782,6 @@ object TorrentEngine {
             }
         }
         return if (bestVideo >= 0) bestVideo else bestAny
-    }
-
-    private fun awaitHandle(manager: SessionManager, infoHash: Sha1Hash): TorrentHandle? {
-        val deadline = System.currentTimeMillis() + 20_000
-        while (System.currentTimeMillis() < deadline) {
-            val handle = runCatching { manager.find(infoHash) }.getOrNull()
-            if (handle != null && handle.isValid) return handle
-            try {
-                Thread.sleep(200)
-            } catch (_: InterruptedException) {
-                return null
-            }
-        }
-        return null
-    }
-
-    /**
-     * libtorrent may write to our `.part` name, or to the torrent's original file name if
-     * the rename did not stick. Playback and the quota scanner only know about [partFile],
-     * so we have to find whichever path actually received the bytes.
-     */
-    private fun findWrittenFile(
-        saveDir: File,
-        partFile: File,
-        info: TorrentInfo,
-        fileIndex: Int,
-    ): File? {
-        val original = info.files().filePath(fileIndex)
-        val candidates = listOf(
-            partFile,
-            File(saveDir, partFile.name),
-            File(saveDir, File(original).name),
-            File(saveDir, original),
-        ).distinct()
-        return candidates.firstOrNull { it.exists() && it.isFile && it.length() > 0 }
-    }
-
-    /** The session releases the file asynchronously, so the rename gets a few attempts. */
-    private fun renameWhenReleased(from: File, finalFile: File): Boolean {
-        if (from.absolutePath == finalFile.absolutePath) return from.exists()
-        if (!from.exists()) return finalFile.exists()
-        repeat(20) {
-            if (from.renameTo(finalFile)) return true
-            try {
-                Thread.sleep(250)
-            } catch (_: InterruptedException) {
-                return false
-            }
-        }
-        return false
     }
 
     private fun snapshot(handle: TorrentHandle): String {

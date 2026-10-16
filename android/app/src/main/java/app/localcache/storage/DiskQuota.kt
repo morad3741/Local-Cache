@@ -3,6 +3,7 @@ package app.localcache.storage
 import android.content.Context
 import android.util.Log
 import app.localcache.Prefs
+import app.localcache.torrent.TorrentEngine
 import java.io.File
 import java.util.Locale
 
@@ -105,12 +106,13 @@ object DiskQuota {
                 if (usage <= target && free >= requiredBytes) break
                 val size = file.length()
                 val name = file.name
-                if (file.delete()) {
+                if (DownloadEngine.deleteIdleFile(file) {
+                        LocalLibrary.deleteMeta(File(file.absolutePath.removeSuffix(".part")))
+                        forgetByPath(file.absolutePath)
+                    }) {
                     usage -= size
                     free += size
                     freed += size
-                    LocalLibrary.deleteMeta(File(file.absolutePath.removeSuffix(".part")))
-                    forgetByPath(file.absolutePath)
                     Log.i(TAG, "removed $name (${size / (1024 * 1024)} MB) to make room")
                 }
             }
@@ -136,10 +138,17 @@ object DiskQuota {
         var deleted = 0
         var freed = 0L
         var failed = 0
+        val pending = DownloadEngine.pendingPaths()
 
         files.filter { it.isFile }.forEach { file ->
+            if (file.absolutePath in pending || TorrentEngine.storageReleaseError() != null) {
+                failed++
+                return@forEach
+            }
             val size = file.length()
-            if (file.delete()) {
+            if (DownloadEngine.deleteIdleFile(file) {
+                    if (!file.name.endsWith(".meta.json")) forgetByPath(file.absolutePath)
+                }) {
                 if (!file.name.endsWith(".meta.json")) {
                     deleted++
                     freed += size
@@ -149,14 +158,18 @@ object DiskQuota {
             }
         }
 
-        CacheRegistry.all().forEach { CacheRegistry.markEvicted(it.cacheKey) }
         Log.i(TAG, "cache wiped: $deleted file(s), ${freed / (1024 * 1024)} MB")
         return Wipe(deleted, freed, failed)
     }
 
     private fun protectedPaths(keepKeys: Set<String>): Set<String> {
         val now = System.currentTimeMillis()
-        val paths = mutableSetOf<String>()
+        val paths = DownloadEngine.pendingPaths().toMutableSet()
+        if (TorrentEngine.storageReleaseError() != null) {
+            CacheRegistry.all().forEach { entry ->
+                entry.filePath?.let { paths.add(it); paths.add("$it.part") }
+            }
+        }
         CacheRegistry.all().forEach { entry ->
             val busy = entry.status == "downloading" || entry.cacheKey in keepKeys
             val recent = now - entry.lastAccessMs < PROTECT_RECENT_MS

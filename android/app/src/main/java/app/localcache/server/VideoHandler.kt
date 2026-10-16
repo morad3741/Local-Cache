@@ -331,7 +331,7 @@ object VideoHandler {
             if (available == null) return 0L
             if (!entry.isTorrent || available.complete) return available.size
             val fromHere = TorrentEngine.readableEndFrom(entry.cacheKey, position)
-            return if (fromHere >= 0) maxOf(fromHere, available.size) else available.size
+            return if (fromHere >= 0) fromHere else available.size
         }
 
         /** Waits for data if the download has not reached this point yet. */
@@ -371,6 +371,9 @@ object VideoHandler {
                 if (entry.status in TERMINAL_STATUSES) {
                     Log.i(TAG, "stop serving ${entry.cacheKey}: ${entry.status}")
                     return false
+                }
+                if (entry.isTorrent && TorrentEngine.isChecking(entry.cacheKey)) {
+                    idleSince = System.currentTimeMillis()
                 }
                 if (System.currentTimeMillis() - idleSince > stallTimeoutMs) {
                     Log.w(TAG, "stalled at $position of ${entry.cacheKey}")
